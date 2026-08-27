@@ -5,13 +5,9 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
+from constants import BUY, HOLD, SELL, VALID_SIGNALS
 from engine.broker import Broker
 from engine.portfolio import Portfolio
-
-BUY = "BUY"
-SELL = "SELL"
-HOLD = "HOLD"
-VALID_SIGNALS = frozenset({BUY, SELL, HOLD})
 
 
 @dataclass
