@@ -16,6 +16,9 @@ dist/
 .coverage
 htmlcov/
 
+# Cached market data. Regenerated on demand, and not ours to redistribute.
+data/cache/
+
 # Notebooks
 .ipynb_checkpoints/
 
