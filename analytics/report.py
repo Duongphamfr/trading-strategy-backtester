@@ -55,6 +55,7 @@ def performance_report(
     equity: pd.Series,
     benchmark: Optional[pd.Series] = None,
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
+    risk_free_rate: float = 0.0,
 ) -> pd.DataFrame:
     """Compute every metric for a strategy, and for a benchmark if given.
 
@@ -64,6 +65,14 @@ def performance_report(
             terms. Omit it, or pass None, to report the strategy alone.
         periods_per_year: Number of bars in a year, 252 for daily data. Applied
             to both columns, so the two remain comparable.
+        risk_free_rate: ANNUAL risk-free rate as a decimal fraction, so 0.04
+            means 4% per year. De-annualized internally by the ratio functions.
+            It affects only Sharpe and Sortino, which measure return in excess of
+            it; total return, volatility, drawdown and Calmar do not use it.
+            Defaults to 0.0, which treats cash as earning nothing. That is close
+            enough to reality for 2020-2021 but clearly wrong from 2023 onward,
+            and leaving it at zero flatters every strategy equally by crediting
+            it with the return it could have had for free.
 
     Returns:
         A DataFrame indexed by metric name, with a Strategy column and, when a
@@ -73,9 +82,13 @@ def performance_report(
         ratios for Sharpe, Sortino and Calmar. Undefined metrics hold NaN.
         Use format_report to render it for reading.
     """
-    columns = {STRATEGY_COLUMN: _metric_column(equity, periods_per_year)}
+    columns = {
+        STRATEGY_COLUMN: _metric_column(equity, periods_per_year, risk_free_rate)
+    }
     if benchmark is not None:
-        columns[BENCHMARK_COLUMN] = _metric_column(benchmark, periods_per_year)
+        columns[BENCHMARK_COLUMN] = _metric_column(
+            benchmark, periods_per_year, risk_free_rate
+        )
 
     report = pd.DataFrame(columns)
     report.index.name = "Metric"
@@ -128,7 +141,11 @@ def print_report(report: pd.DataFrame, title: Optional[str] = None) -> None:
     print(format_report(report))
 
 
-def _metric_column(equity: pd.Series, periods_per_year: int) -> pd.Series:
+def _metric_column(
+    equity: pd.Series,
+    periods_per_year: int,
+    risk_free_rate: float,
+) -> pd.Series:
     """Every metric for one equity curve, in display order."""
     return pd.Series(
         {
@@ -137,8 +154,16 @@ def _metric_column(equity: pd.Series, periods_per_year: int) -> pd.Series:
             VOLATILITY: volatility(equity, periods_per_year),
             MAX_DRAWDOWN: max_drawdown(equity),
             MAX_DRAWDOWN_DURATION: float(max_drawdown_duration(equity)),
-            SHARPE: sharpe_ratio(equity, periods_per_year=periods_per_year),
-            SORTINO: sortino_ratio(equity, periods_per_year=periods_per_year),
+            SHARPE: sharpe_ratio(
+                equity,
+                risk_free_rate=risk_free_rate,
+                periods_per_year=periods_per_year,
+            ),
+            SORTINO: sortino_ratio(
+                equity,
+                risk_free_rate=risk_free_rate,
+                periods_per_year=periods_per_year,
+            ),
             CALMAR: calmar_ratio(equity, periods_per_year),
         },
         dtype=float,
