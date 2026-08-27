@@ -23,6 +23,7 @@ from typing import Union
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 from constants import TRADING_DAYS_PER_YEAR
 
@@ -159,6 +160,150 @@ def max_drawdown_duration(equity: pd.Series) -> int:
     return int(underwater.groupby(stretch_ids).sum().max())
 
 
+def historical_var(equity: pd.Series, confidence: float = 0.95) -> float:
+    """Value at Risk read straight off the observed return distribution.
+
+    Formula:
+        var = -quantile(returns, 1 - confidence)
+
+    At 95% confidence this is the 5th percentile of the periodic returns, sign
+    flipped. The reading is: on the worst 5% of bars, the loss was at least this
+    large. Note what it does not say, which is where VaR gets its bad
+    reputation: it puts a floor under the bad cases and says nothing whatsoever
+    about how far past that floor they went. That is CVaR's job.
+
+    PER-PERIOD FIGURE, NOT ANNUALIZED. On daily data this is a one-day VaR.
+    Scaling it by sqrt(252) to get an annual figure would import the very
+    normality assumption this function was chosen to avoid.
+
+    SIGN CONVENTION: returned as a positive loss magnitude, so 0.021 means a
+    2.1% loss. This is the usual presentation and it makes the three tail
+    measures directly comparable. A negative result is possible and meaningful:
+    it says the quantile itself was a gain, so the curve did not lose even in
+    its worst bars.
+
+    Args:
+        equity: Portfolio value over time.
+        confidence: Confidence level in (0, 1), 0.95 for the 5th percentile.
+
+    Returns:
+        The per-period VaR as a decimal fraction. Returns NaN when fewer than
+        two returns exist or confidence is outside (0, 1).
+    """
+    returns = periodic_returns(equity)
+    if len(returns) < 2 or not 0.0 < confidence < 1.0:
+        return float("nan")
+
+    quantile = float(returns.quantile(1.0 - confidence))
+    if not np.isfinite(quantile):
+        return float("nan")
+
+    return -quantile
+
+
+def parametric_var(equity: pd.Series, confidence: float = 0.95) -> float:
+    """Value at Risk under the assumption that returns are normal.
+
+    Formula:
+        z   = normal quantile at (1 - confidence), about -1.645 at 95%
+        var = -(mean(returns) + z * std(returns, ddof=1))
+
+    Only two numbers from the sample are used, its mean and its standard
+    deviation. Everything else about the shape of the distribution is discarded
+    and replaced by the assumption of a bell curve.
+
+    PER-PERIOD FIGURE, NOT ANNUALIZED, exactly as for the historical version.
+
+    SIGN CONVENTION: positive means a loss, identical to historical_var, so the
+    two can be printed side by side and subtracted.
+
+    THE LIMITATION THAT MATTERS
+    Real return distributions have fat tails: extreme moves happen far more
+    often than a normal distribution allows. Because this estimator knows only
+    the standard deviation, it cannot see them, and it systematically
+    understates how bad the extremes get. That is precisely what the skewness
+    and kurtosis metrics are for, and why they belong next to this number
+    rather than in a separate curiosity section.
+
+    One subtlety worth stating, because it is where a careless demonstration
+    goes wrong: the understatement is not uniform across confidence levels. A
+    handful of violent outliers inflates the standard deviation, which can push
+    parametric VaR *above* the historical figure at 95%, while still falling
+    badly short at 99% and beyond, where the true tail lives. Comparing the two
+    at a single confidence level therefore proves very little; comparing them
+    across levels, and against CVaR, is what exposes the problem.
+
+    Args:
+        equity: Portfolio value over time.
+        confidence: Confidence level in (0, 1), 0.95 for a 1.645-sigma move.
+
+    Returns:
+        The per-period parametric VaR as a decimal fraction. Returns NaN when
+        fewer than two returns exist or confidence is outside (0, 1).
+    """
+    returns = periodic_returns(equity)
+    if len(returns) < 2 or not 0.0 < confidence < 1.0:
+        return float("nan")
+
+    mean = float(returns.mean())
+    deviation = float(returns.std(ddof=1))
+    if not np.isfinite(mean) or not np.isfinite(deviation):
+        return float("nan")
+
+    z_score = float(norm.ppf(1.0 - confidence))
+    return -(mean + z_score * deviation)
+
+
+def conditional_var(equity: pd.Series, confidence: float = 0.95) -> float:
+    """Expected Shortfall: the average loss once the VaR threshold is breached.
+
+    Formula:
+        threshold = quantile(returns, 1 - confidence)
+        cvar      = -mean(returns where returns <= threshold)
+
+    Where VaR asks "how bad does it get before the worst 5% of days", CVaR asks
+    "and how bad are those 5% on average". It therefore answers the question VaR
+    dodges, and it is the reason CVaR is preferred in modern risk work: two
+    portfolios can share a VaR while one loses 5% in its bad tail and the other
+    loses 40%.
+
+    By construction CVaR is always at least as large as the historical VaR at
+    the same confidence, since it averages values that are all at or below the
+    threshold. If the two are close, the tail stops right at the threshold; a
+    wide gap means the tail keeps going, which is exactly the fat-tail
+    signature that parametric VaR cannot represent.
+
+    PER-PERIOD FIGURE, NOT ANNUALIZED.
+
+    SIGN CONVENTION: positive means a loss, as for both VaR functions.
+
+    Args:
+        equity: Portfolio value over time.
+        confidence: Confidence level in (0, 1), 0.95 to average the worst 5%.
+
+    Returns:
+        The per-period CVaR as a decimal fraction. Returns NaN when fewer than
+        two returns exist or confidence is outside (0, 1).
+    """
+    returns = periodic_returns(equity)
+    if len(returns) < 2 or not 0.0 < confidence < 1.0:
+        return float("nan")
+
+    threshold = returns.quantile(1.0 - confidence)
+    if not np.isfinite(threshold):
+        return float("nan")
+
+    # The sample minimum is always at or below the quantile, so the tail is
+    # never empty. Selecting by value rather than by count means the tail may
+    # hold slightly more bars than (1 - confidence) * n when values repeat,
+    # which is the standard treatment of ties.
+    tail = returns[returns <= threshold]
+    if tail.empty:
+        return float("nan")
+
+    return -float(tail.mean())
+
+
 def periodic_returns(equity: pd.Series) -> pd.Series:
     """Simple percentage returns from one bar to the next.
 
@@ -224,6 +369,57 @@ if __name__ == "__main__":
     # there to distinguish, and no other measure here can tell them apart.
     show("Slow recovery", [100, 120, 90, 95, 110, 130])
 
+    def equity_from_returns(returns, start: float = 100.0) -> pd.Series:
+        """Build the equity curve implied by a sequence of periodic returns."""
+        values = [start]
+        for periodic_return in returns:
+            values.append(values[-1] * (1.0 + float(periodic_return)))
+        return as_equity(values)
+
+    def show_tail_risk(label: str, returns) -> None:
+        """Print the three tail measures at two confidence levels."""
+        equity = equity_from_returns(returns)
+        sample = np.asarray(returns, dtype=float)
+
+        print(f"\n{label}")
+        print(f"  {len(sample)} returns, mean {sample.mean():+.5f}, "
+              f"std {sample.std(ddof=1):.5f}")
+
+        for confidence in (0.95, 0.99):
+            historical = historical_var(equity, confidence)
+            parametric = parametric_var(equity, confidence)
+            expected_shortfall = conditional_var(equity, confidence)
+
+            print(f"  at {confidence:.0%} confidence")
+            print(f"    historical VaR      {historical:8.4%}")
+            print(f"    parametric VaR      {parametric:8.4%}")
+            print(f"    CVaR                {expected_shortfall:8.4%}")
+            print(f"    historical / param  {historical / parametric:8.2f}")
+            print(f"    CVaR / historical   "
+                  f"{expected_shortfall / historical:8.2f}"
+                  f"   (CVaR >= VaR: "
+                  f"{expected_shortfall >= historical - 1e-12})")
+
+    # Drawn from an actual normal distribution, so the assumption behind
+    # parametric VaR holds by construction. The two estimates should land close
+    # together, which is the control case: any gap seen elsewhere is a property
+    # of the data, not an artefact of the code.
+    generator = np.random.default_rng(42)
+    show_tail_risk(
+        "Near-normal returns (the assumption holds)",
+        generator.normal(0.0005, 0.01, 500),
+    )
+
+    # 93 quiet gains and a left tail that keeps going: -3% down to -10%. Seven
+    # percent of the mass sits in the tail, so the 5% quantile lands inside it
+    # and historical VaR already exceeds the parametric estimate. The real
+    # verdict is the 99% row, where the gap widens sharply, and the CVaR/VaR
+    # multiple, which stays far above what a bell curve would produce.
+    show_tail_risk(
+        "Fat-tailed returns (the assumption fails)",
+        [0.005] * 93 + [-0.03, -0.035, -0.04, -0.05, -0.06, -0.08, -0.10],
+    )
+
     print("\nEdge cases")
     empty = pd.Series(dtype=float)
     single = pd.Series([100.0])
@@ -237,3 +433,8 @@ if __name__ == "__main__":
     print(f"  no loss  -> max_dd={max_drawdown(rising)} "
           f"duration={max_drawdown_duration(rising)} "
           f"(never below its peak)")
+    print(f"  no loss  -> historical_var={historical_var(rising):.4%} "
+          f"cvar={conditional_var(rising):.4%} "
+          f"(negative: even the worst bars were gains)")
+    print(f"  bad conf -> historical_var={historical_var(rising, 1.5)} "
+          f"parametric_var={parametric_var(rising, 0.0)}")
