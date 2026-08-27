@@ -23,15 +23,58 @@ class MovingAverageCrossover(BaseStrategy):
     Attributes:
         fast_window: Lookback of the short moving average, in bars.
         slow_window: Lookback of the long moving average, in bars.
+        enter_on_existing_trend: Whether to open a position when the warm-up
+            ends with the fast average already above the slow one.
     """
 
-    def __init__(self, fast_window: int = 50, slow_window: int = 200) -> None:
+    def __init__(
+        self,
+        fast_window: int = 50,
+        slow_window: int = 200,
+        enter_on_existing_trend: bool = False,
+    ) -> None:
         """Configure the two moving averages.
+
+        THE WARM-UP BOUNDARY DECISION
+        Both averages need their full window before they exist, so the first
+        bars of any history carry no signal. When they finally become defined,
+        the fast average may already be above the slow one: the trend is under
+        way, but the crossing that started it happened before the data begins
+        and is therefore invisible to the strategy.
+
+        enter_on_existing_trend decides what to do at that boundary, and the
+        decision is far from cosmetic. On AAPL over 2020-2022 the averages
+        become defined in October 2020 with the fast one on top, and the two
+        settings differ by roughly twenty percentage points of total return.
+
+        False, the default, waits for a golden cross to actually occur within
+        the observed data. It is the conservative reading, and it is the default
+        precisely because it refuses to credit the strategy with a trend it
+        never saw form. Buying into a pre-existing trend means the entry rests
+        on information from before the sample, which quietly makes the result a
+        function of the arbitrary start date of the download rather than of the
+        rule being tested. Keeping the default conservative means an optimistic
+        number can only ever be produced deliberately, never by accident.
+
+        The cost of that honesty is real and should be stated rather than
+        hidden: the strategy may sit in cash through a large move it would have
+        ridden, as it does through the 2020-2021 rally. That is a limitation of
+        the measurement, not evidence that trend-following does not work.
+
+        True buys in on the first bar where both averages exist and the fast one
+        is above. It measures the strategy as a *state* ("be invested while in
+        an uptrend") rather than as a set of *events*, which is closer to how
+        crossover rules are usually framed in the literature. It is a legitimate
+        choice, available explicitly, and worth reporting alongside the default
+        rather than instead of it.
 
         Args:
             fast_window: Number of bars in the short average. Must be positive
                 and strictly smaller than slow_window.
             slow_window: Number of bars in the long average. Must be positive.
+            enter_on_existing_trend: Whether to buy into a trend that was
+                already established when the averages first became computable.
+                Defaults to False, the conservative behaviour described above.
 
         Raises:
             ValueError: If either window is not a positive integer, or if
@@ -58,9 +101,14 @@ class MovingAverageCrossover(BaseStrategy):
                 f"Equal or inverted windows cannot produce a crossover."
             )
 
-        super().__init__(fast_window=fast_window, slow_window=slow_window)
+        super().__init__(
+            fast_window=fast_window,
+            slow_window=slow_window,
+            enter_on_existing_trend=bool(enter_on_existing_trend),
+        )
         self.fast_window = fast_window
         self.slow_window = slow_window
+        self.enter_on_existing_trend = bool(enter_on_existing_trend)
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
         """Emit BUY on golden crosses, SELL on death crosses, HOLD elsewhere.
@@ -68,6 +116,11 @@ class MovingAverageCrossover(BaseStrategy):
         No-look-ahead compliance: both averages come from rolling(), whose window
         at bar T covers only bars at or before T, and the only shift applied is
         .shift(1), which looks one bar into the past. Nothing reaches forward.
+
+        On the warm-up boundary, see enter_on_existing_trend. The choice is not
+        cosmetic: on AAPL over 2020-2022 the averages become defined in October
+        2020 with the fast one already on top, so waiting for a visible crossing
+        leaves the strategy in cash through the entire 2020-2021 rally.
 
         If the history is shorter than slow_window the long average is never
         defined, so the result is all HOLD and the strategy simply never trades.
@@ -107,6 +160,16 @@ class MovingAverageCrossover(BaseStrategy):
         signals = self.hold_signals(data)
         signals[crossed_up] = BUY
         signals[crossed_down] = SELL
+
+        # The trend may already be under way when the averages become defined.
+        # The crossing that started it is simply not visible in this window, so
+        # the transition rules above cannot fire and the strategy would sit out
+        # a trend it is designed to ride. This buys into it instead.
+        if self.enter_on_existing_trend and defined.any():
+            warm_up_end = defined.idxmax()
+            if above[warm_up_end]:
+                signals[warm_up_end] = BUY
+
         return signals
 
 
