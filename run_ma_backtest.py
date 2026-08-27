@@ -58,6 +58,8 @@ def main() -> None:
         performance_report(
             equity=result.equity_curve["total_value"],
             benchmark=result.benchmark_curve,
+            trade_log=result.trade_log,
+            positions=result.equity_curve["shares"],
         ),
         title="Performance report",
     )

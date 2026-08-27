@@ -29,6 +29,11 @@ from scipy import stats
 
 from constants import TRADING_DAYS_PER_YEAR
 
+# A position smaller than this counts as flat. Selling a whole position leaves
+# exactly 0.0 today, but float arithmetic in a future partial-sizing model could
+# leave a speck behind, and a speck is not an exposure.
+POSITION_TOLERANCE = 1e-12
+
 
 def volatility(
     equity: pd.Series,
@@ -160,6 +165,53 @@ def max_drawdown_duration(equity: pd.Series) -> int:
     # group is that stretch's length. Vectorised, no explicit loop over bars.
     stretch_ids = (~underwater).cumsum()
     return int(underwater.groupby(stretch_ids).sum().max())
+
+
+def exposure(positions: pd.Series) -> float:
+    """Fraction of bars on which a position was actually held.
+
+    Formula:
+        exposure = count(position != 0) / number of bars
+
+    WHY THIS BELONGS AMONG THE RISK MEASURES
+    Every other function in this module measures a property of the return
+    stream, and each of them silently assumes that stream describes an invested
+    portfolio. When it does not, they all mislead in the same direction. A
+    strategy flat in cash returns exactly zero on those bars, and those zeros:
+        - shrink volatility and both VaR figures, since most bars have no move;
+        - inflate skewness and excess kurtosis to absurd levels, because the
+          distribution becomes a spike at zero with a few outliers attached;
+        - drag beta and R squared toward zero, since a constant is uncorrelated
+          with anything.
+    None of that reflects risk management. It reflects absence. Exposure is the
+    single number that makes the distortion visible, which is why it is reported
+    first, ahead of the measures it qualifies.
+
+    WHICH SOURCE IS USED, AND WHY NOT THE OBVIOUS ONE
+    The position history recorded by the portfolio, one entry per bar. The
+    tempting alternative, counting bars whose return is nonzero, looks equivalent
+    and is not: a bar where the position was held but the price happened to close
+    unchanged yields a zero return and would be scored as flat. That undercounts
+    exposure, and it does so precisely on the quiet days. The recorded position
+    is what actually happened, so it is the ground truth.
+
+    Absolute value is used, so a short position counts as exposure just like a
+    long one. Nothing shorts today, but Phase 6 might.
+
+    Args:
+        positions: Number of units held on each bar, as recorded in the
+            portfolio's shares column.
+
+    Returns:
+        A fraction in [0, 1], so 0.0119 means the strategy held a position on
+        1.19% of the bars. Returns NaN for an empty input.
+    """
+    positions = as_float_series(positions)
+    if positions.empty:
+        return float("nan")
+
+    held = positions.abs() > POSITION_TOLERANCE
+    return float(held.mean())
 
 
 def historical_var(equity: pd.Series, confidence: float = 0.95) -> float:
@@ -612,6 +664,22 @@ if __name__ == "__main__":
 
     show_distribution("Near-normal returns - distribution shape", near_normal)
     show_distribution("Fat-tailed returns - distribution shape", fat_tailed)
+
+    # Exposure counts held bars, so the answers are checkable by eye. The third
+    # case is the one that matters: a position held across a bar that closed
+    # unchanged still counts, which is exactly what counting nonzero returns
+    # would have missed.
+    print("\nExposure")
+    for label, held in [
+        ("flat throughout", [0.0, 0.0, 0.0, 0.0]),
+        ("held 2 of 4 bars", [0.0, 10.0, 10.0, 0.0]),
+        ("held through a flat bar", [0.0, 10.0, 10.0, 10.0]),
+        ("held every bar", [5.0, 5.0, 5.0, 5.0]),
+    ]:
+        value = exposure(pd.Series(held))
+        print(f"  {label:<24} {value:7.2%}   ({sum(1 for s in held if s):.0f}/"
+              f"{len(held)})")
+    print(f"  {'empty':<24} {exposure(pd.Series(dtype=float))}")
 
     print("\nEdge cases")
     empty = pd.Series(dtype=float)
