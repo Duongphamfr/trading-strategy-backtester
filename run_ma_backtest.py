@@ -6,6 +6,7 @@ at the edge, while the engine and the strategy stay unaware of who called them.
 Proper performance measurement arrives in Phase 3.
 """
 
+from analytics.report import performance_report, print_report
 from data.market_data import get_price_data
 from engine.backtester import Backtester
 from strategies.moving_average import MovingAverageCrossover
@@ -45,14 +46,21 @@ def main() -> None:
     print("\nTrade log")
     if not result.trade_log:
         print("  (no trades)")
-        return
+    else:
+        print(f"  {'Date':<12} {'Action':<6} {'Price':>10} {'Shares':>12}")
+        for trade in result.trade_log:
+            print(
+                f"  {trade['date'].date()!s:<12} {trade['action']:<6} "
+                f"{trade['price']:>10,.2f} {trade['shares']:>12,.4f}"
+            )
 
-    print(f"  {'Date':<12} {'Action':<6} {'Price':>10} {'Shares':>12}")
-    for trade in result.trade_log:
-        print(
-            f"  {trade['date'].date()!s:<12} {trade['action']:<6} "
-            f"{trade['price']:>10,.2f} {trade['shares']:>12,.4f}"
-        )
+    print_report(
+        performance_report(
+            equity=result.equity_curve["total_value"],
+            benchmark=result.benchmark_curve,
+        ),
+        title="Performance report",
+    )
 
 
 if __name__ == "__main__":
