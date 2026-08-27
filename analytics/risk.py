@@ -1,9 +1,11 @@
 """Risk measures computed from an equity curve.
 
 This module answers "how much did it hurt", separately from "how much did it
-earn". It covers dispersion, through annualized volatility, and loss, through the
-drawdown family. The risk-adjusted ratios that combine the two live in
-analytics.metrics, which imports from here.
+earn". It covers dispersion through annualized volatility, loss through the
+drawdown family, the size of the bad tail through VaR and CVaR, and finally the
+shape of the return distribution, which is what decides whether any of the
+normality-based figures deserve to be trusted. The risk-adjusted ratios that
+combine risk with return live in analytics.metrics, which imports from here.
 
 Like metrics, these functions know nothing about strategies, brokers or data
 sources: hand them a Series of portfolio values indexed by date and they will
@@ -19,11 +21,11 @@ Sign conventions used throughout:
       case. Durations, being counts, return 0 instead.
 """
 
-from typing import Union
+from typing import NamedTuple, Union
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy import stats
 
 from constants import TRADING_DAYS_PER_YEAR
 
@@ -250,7 +252,7 @@ def parametric_var(equity: pd.Series, confidence: float = 0.95) -> float:
     if not np.isfinite(mean) or not np.isfinite(deviation):
         return float("nan")
 
-    z_score = float(norm.ppf(1.0 - confidence))
+    z_score = float(stats.norm.ppf(1.0 - confidence))
     return -(mean + z_score * deviation)
 
 
@@ -302,6 +304,175 @@ def conditional_var(equity: pd.Series, confidence: float = 0.95) -> float:
         return float("nan")
 
     return -float(tail.mean())
+
+
+# ---------------------------------------------------------------------------
+# Distribution shape
+#
+# The tail-risk measures above quantify how bad the losses were. This section
+# asks a different question: what shape is the return distribution, and is the
+# bell curve that parametric_var relies on a defensible description of it? The
+# answer is usually no, and these are the numbers that prove it.
+# ---------------------------------------------------------------------------
+
+
+class JarqueBeraResult(NamedTuple):
+    """Outcome of a Jarque-Bera normality test.
+
+    Attributes:
+        statistic: The test statistic, zero for a perfectly normal sample and
+            growing as skewness or excess kurtosis depart from zero.
+        p_value: Probability of observing a statistic at least this large if the
+            returns really were normal.
+    """
+
+    statistic: float
+    p_value: float
+
+
+def skewness(equity: pd.Series) -> float:
+    """Skewness of the curve's periodic returns.
+
+    Skewness measures asymmetry. A symmetric distribution has zero skewness;
+    the sign tells you which side is stretched.
+
+    SIGN CONVENTION AND WHY NEGATIVE IS THE DANGEROUS ONE
+    Negative skewness means a longer LEFT tail: the large moves are losses, and
+    they are bigger and rarer than the gains, which are smaller and more
+    frequent. This is the normal state of affairs for equities and for most
+    short-volatility strategies, and it is uncomfortable because it is exactly
+    the profile that looks excellent right up until it does not. A strategy can
+    post a long series of small gains, flattering every average-based metric,
+    while the loss that reverses all of them sits in a tail no average has seen
+    yet. Positive skewness is the opposite and more forgiving shape: frequent
+    small losses paid for by rare large gains, which is how trend-following is
+    supposed to earn its keep.
+
+    CONNECTION TO THE TAIL-RISK SECTION
+    parametric_var assumes a symmetric bell curve, so it is blind to skewness by
+    construction. Under negative skew it prices the left tail as if it were a
+    mirror of the right one, which it is not, and understates it.
+
+    PER-PERIOD FIGURE. Computed on the same daily returns as everything else.
+    Skewness is dimensionless, so there is nothing to annualize, but it does
+    depend on the sampling frequency: monthly returns are typically less skewed
+    than daily ones.
+
+    Note on the estimator: scipy's default biased estimator is used, the same
+    one the Jarque-Bera statistic is built from, so the figures reported here
+    reconcile with jarque_bera below. The bias-corrected variant differs by a
+    factor that is negligible at realistic sample sizes.
+
+    Args:
+        equity: Portfolio value over time.
+
+    Returns:
+        Sample skewness as a dimensionless number, 0 for a symmetric sample.
+        Returns NaN when fewer than three returns exist or the returns are all
+        identical, since a distribution with no spread has no shape.
+    """
+    returns = _returns_for_shape(equity)
+    if returns is None:
+        return float("nan")
+
+    return float(stats.skew(returns))
+
+
+def kurtosis(equity: pd.Series, excess: bool = True) -> float:
+    """Kurtosis of the curve's periodic returns, excess by default.
+
+    Kurtosis measures how much of the variance comes from rare extreme moves
+    rather than from ordinary ones. A normal distribution has a raw kurtosis of
+    exactly 3, so the convention is to subtract it and report EXCESS kurtosis,
+    which is 0 for a normal sample and positive for a fat-tailed one.
+
+    THE DIRECT SIGNATURE OF FAT TAILS
+    Positive excess kurtosis is the quantitative statement that extreme moves
+    occur more often than a bell curve permits. It is not a vague warning: it is
+    the same phenomenon parametric_var underestimates, measured directly. If
+    this number is large, the normal-quantile VaR above is understating the far
+    tail, and the historical and conditional versions are the ones to trust.
+    Together they let you say something precise rather than hand-wavy: "I do
+    compute Sharpe and parametric VaR, and I also compute the kurtosis that
+    tells me when not to believe them."
+
+    PER-PERIOD FIGURE, dimensionless, nothing to annualize. Like skewness it is
+    sensitive to sampling frequency: fat tails are far more pronounced in daily
+    returns than in monthly ones.
+
+    Args:
+        equity: Portfolio value over time.
+        excess: True returns excess kurtosis, normal = 0, which is the usual
+            reporting convention. False returns raw kurtosis, normal = 3.
+
+    Returns:
+        Kurtosis as a dimensionless number. Returns NaN when fewer than three
+        returns exist or the returns are all identical.
+    """
+    returns = _returns_for_shape(equity)
+    if returns is None:
+        return float("nan")
+
+    return float(stats.kurtosis(returns, fisher=excess))
+
+
+def jarque_bera(equity: pd.Series) -> JarqueBeraResult:
+    """Formal test of whether the periodic returns could be normal.
+
+    Formula:
+        jb = n / 6 * (skewness ** 2 + excess_kurtosis ** 2 / 4)
+
+    The test is built from nothing but the two numbers above, which is why it
+    belongs beside them: it turns "the skew and kurtosis look wrong" into a
+    statement with a probability attached. The statistic is zero for a perfectly
+    normal sample and grows as either departure widens.
+
+    HOW TO READ IT
+    The null hypothesis is that the returns are normally distributed. A LOW
+    p-value rejects that hypothesis. Conventionally, below 0.05 means the sample
+    is inconsistent with normality, and financial return series typically come
+    back with p-values so small they print as zero. That is the useful result,
+    because it converts the assumption behind sharpe_ratio and parametric_var
+    from something taken on faith into something explicitly measured and
+    rejected. A high p-value does not prove normality; it only means this
+    particular test found no evidence against it.
+
+    Caveat on sample size: the p-value comes from an asymptotic chi-squared
+    approximation with two degrees of freedom, and it is unreliable for small
+    samples, where the test tends to reject too readily. Treat the statistic on
+    a few dozen bars as indicative rather than conclusive.
+
+    PER-PERIOD FIGURE, computed on the same returns as everything else.
+
+    Args:
+        equity: Portfolio value over time.
+
+    Returns:
+        A JarqueBeraResult holding the statistic and its p-value. Both are NaN
+        when fewer than three returns exist or the returns are all identical.
+    """
+    returns = _returns_for_shape(equity)
+    if returns is None:
+        return JarqueBeraResult(float("nan"), float("nan"))
+
+    result = stats.jarque_bera(returns)
+    return JarqueBeraResult(float(result.statistic), float(result.pvalue))
+
+
+def _returns_for_shape(equity: pd.Series) -> Union[pd.Series, None]:
+    """Returns usable for a shape statistic, or None if there is no shape.
+
+    Skewness and kurtosis are ratios of central moments to powers of the
+    standard deviation, so they are undefined when the returns do not vary at
+    all. Three observations is the practical minimum for a third moment to mean
+    anything.
+    """
+    returns = periodic_returns(equity)
+    if len(returns) < 3:
+        return None
+    if float(returns.std(ddof=0)) <= 0:
+        return None
+    return returns
 
 
 def periodic_returns(equity: pd.Series) -> pd.Series:
@@ -400,25 +571,47 @@ if __name__ == "__main__":
                   f"   (CVaR >= VaR: "
                   f"{expected_shortfall >= historical - 1e-12})")
 
+    def show_distribution(label: str, returns) -> None:
+        """Print the shape statistics and the normality verdict."""
+        equity = equity_from_returns(returns)
+        test = jarque_bera(equity)
+
+        print(f"\n{label}")
+        print(f"  skewness              {skewness(equity):+12.4f}")
+        print(f"  excess kurtosis       {kurtosis(equity):+12.4f}"
+              f"   (raw {kurtosis(equity, excess=False):.4f}, normal = 3)")
+        print(f"  Jarque-Bera statistic {test.statistic:12.4f}")
+        print(f"  Jarque-Bera p-value   {test.p_value:12.3g}")
+        verdict = (
+            "rejects normality"
+            if test.p_value < 0.05
+            else "cannot reject normality"
+        )
+        print(f"  verdict at 5%         {verdict}")
+
+    # The two samples are defined once and reused by both sections below, so the
+    # tail measures and the shape statistics are describing the very same data.
+
     # Drawn from an actual normal distribution, so the assumption behind
-    # parametric VaR holds by construction. The two estimates should land close
-    # together, which is the control case: any gap seen elsewhere is a property
-    # of the data, not an artefact of the code.
+    # parametric VaR holds by construction. This is the control case: the two
+    # VaR estimates should agree, skewness and excess kurtosis should sit near
+    # zero, and Jarque-Bera should fail to reject. Any gap seen in the other
+    # sample is then a property of the data, not an artefact of the code.
     generator = np.random.default_rng(42)
-    show_tail_risk(
-        "Near-normal returns (the assumption holds)",
-        generator.normal(0.0005, 0.01, 500),
-    )
+    near_normal = generator.normal(0.0005, 0.01, 500)
 
     # 93 quiet gains and a left tail that keeps going: -3% down to -10%. Seven
     # percent of the mass sits in the tail, so the 5% quantile lands inside it
     # and historical VaR already exceeds the parametric estimate. The real
     # verdict is the 99% row, where the gap widens sharply, and the CVaR/VaR
     # multiple, which stays far above what a bell curve would produce.
-    show_tail_risk(
-        "Fat-tailed returns (the assumption fails)",
-        [0.005] * 93 + [-0.03, -0.035, -0.04, -0.05, -0.06, -0.08, -0.10],
-    )
+    fat_tailed = [0.005] * 93 + [-0.03, -0.035, -0.04, -0.05, -0.06, -0.08, -0.10]
+
+    show_tail_risk("Near-normal returns (the assumption holds)", near_normal)
+    show_tail_risk("Fat-tailed returns (the assumption fails)", fat_tailed)
+
+    show_distribution("Near-normal returns - distribution shape", near_normal)
+    show_distribution("Fat-tailed returns - distribution shape", fat_tailed)
 
     print("\nEdge cases")
     empty = pd.Series(dtype=float)
