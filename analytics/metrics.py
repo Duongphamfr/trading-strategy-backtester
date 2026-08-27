@@ -19,8 +19,11 @@ Sign conventions used throughout:
       case.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from analytics.risk import as_float_series, max_drawdown, periodic_returns
 from constants import TRADING_DAYS_PER_YEAR
@@ -250,6 +253,135 @@ def calmar_ratio(
     return float(annual_return / abs(worst_drawdown))
 
 
+class CapmResult(NamedTuple):
+    """Outcome of regressing strategy excess returns on market excess returns.
+
+    Attributes:
+        alpha: Annualized intercept, the return not explained by market exposure.
+        beta: Slope, the strategy's sensitivity to market moves.
+        r_squared: Fraction of the strategy's variance explained by the market,
+            between 0 and 1.
+    """
+
+    alpha: float
+    beta: float
+    r_squared: float
+
+
+def capm_regression(
+    equity: pd.Series,
+    benchmark: pd.Series,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> CapmResult:
+    """Regress the strategy's excess returns on the market's excess returns.
+
+    Model:
+        strategy_excess[t] = alpha_per_period + beta * market_excess[t] + error
+        where excess means the return minus the per-period risk-free rate.
+
+    HOW TO READ THE THREE NUMBERS
+    Beta is market sensitivity. A beta of 1 means the strategy moves with the
+    market one for one; 0.5 means it captures half of each move, up and down;
+    above 1 means it amplifies them. Beta near 0 means the returns are unrelated
+    to the market, which for a long-only equity strategy almost always means it
+    was not invested rather than that it found something genuinely uncorrelated.
+
+    Alpha is the part of the return that market exposure does not account for.
+    It is the closest thing here to "value added": a strategy that returned 20%
+    with a beta of 1 in a market that returned 20% has added nothing, and its
+    alpha will be near zero. Positive alpha is the interesting result, and also
+    the one to be most suspicious of, because it is exactly what overfitting
+    manufactures.
+
+    R squared is how much of the strategy's variance the market explains. High
+    R squared means the strategy is essentially a leveraged or dampened version
+    of the index, whatever it calls itself. Low R squared means its ups and downs
+    came from somewhere else, and it also means the alpha and beta estimates are
+    resting on a weak relationship and should be trusted less.
+
+    THE CASH-HEAVY CASE, WHICH YOU WILL MEET IMMEDIATELY
+    A strategy that sits in cash most of the time posts a return of exactly zero
+    on every bar it is flat. Those zeros are uncorrelated with the market by
+    construction, so beta collapses toward zero and R squared with it. That is
+    not evidence of market neutrality or of skill at avoiding the index; it is
+    just an absence of exposure, and the honest way to report it is alongside the
+    fraction of time the strategy was actually invested. Beta measured over a
+    period the strategy mostly sat out describes the cash, not the strategy.
+
+    ALPHA IS REPORTED ANNUALIZED
+    The regression yields a per-period intercept, which on daily data is a
+    number around 1e-4 and impossible to read. It is multiplied by
+    periods_per_year to give an annual figure, so 0.03 means three percentage
+    points of annual return unexplained by the market. This is arithmetic
+    scaling, not compounding, consistent with how sharpe_ratio annualizes its
+    numerator. Beta and R squared are dimensionless and need no scaling.
+
+    IMPLEMENTATION CHOICE
+    scipy.stats.linregress is used. It is already a project dependency, and it
+    returns precisely the three quantities needed, with the numerics handled by
+    a well-tested library rather than by a hand-rolled covariance ratio.
+
+    statsmodels is deliberately NOT added. It would give standard errors,
+    t-statistics and p-values, and that is a real limitation worth being honest
+    about: an alpha reported without a standard error is a point estimate, not a
+    claim of statistical significance. Alpha is estimated far less precisely than
+    beta, and on a few years of daily data its confidence interval is typically
+    wide enough to contain zero. If this project ever needs to assert that an
+    alpha is significant rather than merely positive, statsmodels earns its place
+    then. Until that claim is made, it would be a dependency carried for nothing.
+
+    Args:
+        equity: Strategy portfolio value over time.
+        benchmark: Market portfolio value over time, typically buy-and-hold.
+        risk_free_rate: ANNUAL risk-free rate as a decimal fraction, de-annualized
+            internally and subtracted from both return series.
+        periods_per_year: Number of bars in a year, 252 for daily data. Used to
+            annualize alpha and to de-annualize the risk-free rate.
+
+    Returns:
+        A CapmResult with annualized alpha, beta and R squared. All three are
+        NaN when the two curves share fewer than three common dates, when the
+        market's excess returns do not vary, or when the inputs are out of range.
+        The two series are aligned on their common dates, so curves of different
+        lengths are handled by intersection rather than by error.
+    """
+    undefined = CapmResult(float("nan"), float("nan"), float("nan"))
+
+    if periods_per_year <= 0:
+        return undefined
+
+    periodic_risk_free = _deannualize(risk_free_rate, periods_per_year)
+    if not np.isfinite(periodic_risk_free):
+        return undefined
+
+    aligned = pd.DataFrame(
+        {
+            "strategy": periodic_returns(equity),
+            "market": periodic_returns(benchmark),
+        }
+    ).dropna()
+
+    # Three points is the practical minimum: two would fit a line through both
+    # observations exactly and report a meaningless R squared of 1.
+    if len(aligned) < 3:
+        return undefined
+
+    strategy_excess = aligned["strategy"] - periodic_risk_free
+    market_excess = aligned["market"] - periodic_risk_free
+
+    if float(market_excess.std(ddof=0)) <= 0:
+        return undefined
+
+    regression = stats.linregress(market_excess, strategy_excess)
+
+    return CapmResult(
+        alpha=float(regression.intercept) * periods_per_year,
+        beta=float(regression.slope),
+        r_squared=float(regression.rvalue) ** 2,
+    )
+
+
 def _deannualize(annual_rate: float, periods_per_year: int) -> float:
     """Convert an annual rate into the equivalent rate for one bar."""
     if annual_rate <= -1.0 or periods_per_year <= 0:
@@ -335,6 +467,49 @@ if __name__ == "__main__":
         [0.01] * 9 + [-0.05],
     )
 
+    # CAPM recovery test. Strategy returns are built from a known relationship,
+    # so the regression has a right answer to be checked against rather than
+    # merely a plausible-looking one.
+    BETA_TRUE = 0.60
+    ALPHA_TRUE = 0.03
+    PERIODS = 252
+    BARS = 2000
+
+    generator = np.random.default_rng(7)
+    market_returns = generator.normal(0.0004, 0.011, BARS)
+    noise = generator.normal(0.0, 0.001, BARS)
+    built_returns = ALPHA_TRUE / PERIODS + BETA_TRUE * market_returns + noise
+
+    market_equity = equity_from_returns(market_returns)
+    built_equity = equity_from_returns(built_returns)
+    recovered = capm_regression(
+        built_equity, market_equity, periods_per_year=PERIODS
+    )
+
+    print(f"\nCAPM recovery test: {BARS} bars of "
+          f"alpha={ALPHA_TRUE:.2%}/yr + beta={BETA_TRUE} * market + noise")
+    print(f"  beta      true {BETA_TRUE:8.4f}   recovered {recovered.beta:8.4f}")
+    print(f"  alpha     true {ALPHA_TRUE:8.4f}   recovered {recovered.alpha:8.4f}")
+    print(f"  r_squared                  recovered {recovered.r_squared:8.4f}")
+
+    # The cash-heavy case the docstring warns about: the same market, but the
+    # strategy is only exposed for the first 40 of 2000 bars and flat otherwise.
+    # Beta and R squared both collapse, and neither figure says anything about
+    # skill. They describe a portfolio that was almost never in the market.
+    cash_heavy_returns = np.zeros(BARS)
+    cash_heavy_returns[:40] = market_returns[:40]
+    cash_heavy = capm_regression(
+        equity_from_returns(cash_heavy_returns),
+        market_equity,
+        periods_per_year=PERIODS,
+    )
+
+    print(f"\nCash-heavy strategy: fully exposed on 40 of {BARS} bars, "
+          f"flat on the rest")
+    print(f"  beta      {cash_heavy.beta:8.4f}   (exposure was 1.0 while invested)")
+    print(f"  alpha     {cash_heavy.alpha:8.4f}")
+    print(f"  r_squared {cash_heavy.r_squared:8.4f}")
+
     print("\nEdge cases")
     empty = pd.Series(dtype=float)
     single = pd.Series([100.0])
@@ -347,3 +522,6 @@ if __name__ == "__main__":
     print(f"  no loss  -> sortino={sortino_ratio(rising)} "
           f"calmar={calmar_ratio(rising)} "
           f"(both undefined: no downside, no drawdown)")
+    print(f"  no overlap -> capm={capm_regression(rising, empty)}")
+    print(f"  flat market -> capm="
+          f"{capm_regression(rising, as_equity([100.0] * 5))}")
