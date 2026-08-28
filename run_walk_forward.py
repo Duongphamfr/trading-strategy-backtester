@@ -421,9 +421,24 @@ def print_summary(rolls: List[Roll]) -> None:
     out_mean = table["out_sharpe"].mean()
     penalty = in_sample_mean - out_mean
 
-    positive = (table["out_sharpe"] > 0).mean()
-    beat_sharpe = (table["out_sharpe"] > table["out_benchmark_sharpe"]).mean()
-    beat_return = (table["out_return"] > table["out_benchmark_return"]).mean()
+    # A window the strategy sat out entirely has no out-of-sample Sharpe to
+    # report, and pandas resolves a comparison against NaN as False. Left alone,
+    # such a roll would count as a failure in the numerator of every rate below
+    # while the means above quietly dropped it, putting figures printed in the
+    # same block on two different denominators. The rates are therefore taken
+    # over the rolls where the comparison exists, and any exclusion is printed
+    # rather than absorbed. On the default history nothing is excluded, so this
+    # changes no published number; it stops a future run from misreporting one.
+    scored = table[table["out_sharpe"].notna()]
+    rated = scored[scored["out_benchmark_sharpe"].notna()]
+    returns_rated = table[table["out_return"].notna()
+                          & table["out_benchmark_return"].notna()]
+
+    positive = (scored["out_sharpe"] > 0).mean()
+    beat_sharpe = (rated["out_sharpe"] > rated["out_benchmark_sharpe"]).mean()
+    beat_return = (returns_rated["out_return"]
+                   > returns_rated["out_benchmark_return"]).mean()
+    unscored = len(table) - len(scored)
 
     combinations = list(zip(table["fast"], table["slow"]))
     unchanged = sum(
@@ -444,6 +459,11 @@ def print_summary(rolls: List[Roll]) -> None:
     print(f"  Beat buy-and-hold on return    {beat_return:>7.0%} of rolls")
     print(f"  Median out-of-sample Sharpe    "
           f"{table['out_sharpe'].median():>7.3f}")
+    if unscored:
+        print(f"  ... the three rates above are over the {len(scored)} of "
+              f"{len(rolls)} rolls whose\n      out-of-sample Sharpe is defined. "
+              f"{unscored} window(s) were spent entirely in\n      cash, which "
+              f"leaves no return series to score and no verdict to give.")
     print()
     print(f"  Distinct window pairs chosen   {len(set(combinations)):>7} "
           f"of {len(rolls)} rolls")

@@ -13,6 +13,7 @@ real prices would eventually fail for a reason that has nothing to do with the
 code under test.
 """
 
+import math
 from typing import List
 
 import pandas as pd
@@ -76,3 +77,37 @@ def wave_prices() -> pd.DataFrame:
 def initial_cash() -> float:
     """Starting capital used across the engine tests."""
     return 10_000.0
+
+
+# A drifting oscillation, long enough for the strategies to warm up and then
+# change their minds several times. Generated from a closed-form expression
+# rather than written out because the causality tests care about one property
+# only, that the series is the same on every call, and not about any individual
+# price. There is deliberately no random number generator involved, seeded or
+# otherwise: a fixed seed still leaves the values at the mercy of the library's
+# internals, whereas sine and a linear drift are pinned by arithmetic.
+#
+# The parameters are chosen so signals actually fire. A series too smooth for
+# the moving averages to cross, or too tame for the RSI to reach its bands,
+# would make a causality test pass by having nothing to disagree about, which is
+# the failure mode the strategy tests below guard against explicitly.
+OSCILLATING_BARS = 90
+OSCILLATION_PERIOD = 25.0
+OSCILLATION_AMPLITUDE = 0.18
+OSCILLATION_DRIFT = 0.25
+
+
+@pytest.fixture
+def oscillating_prices() -> pd.DataFrame:
+    """Ninety bars swinging up and down around a gently rising trend."""
+    closes = [
+        round(
+            100.0
+            * (1.0 + OSCILLATION_AMPLITUDE
+               * math.sin(2.0 * math.pi * bar / OSCILLATION_PERIOD))
+            + OSCILLATION_DRIFT * bar,
+            4,
+        )
+        for bar in range(OSCILLATING_BARS)
+    ]
+    return _frame(closes)

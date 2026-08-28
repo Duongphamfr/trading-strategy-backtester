@@ -655,13 +655,18 @@ def render_charts(state: Dict[str, Any]) -> None:
 @st.cache_data(show_spinner=False)
 def cached_sweep(prices: pd.DataFrame, initial_cash: float, fast_windows: Tuple,
                  slow_windows: Tuple, commission: float, spread: float,
-                 slippage: float) -> pd.DataFrame:
+                 slippage: float, enter_on_existing_trend: bool) -> pd.DataFrame:
     """Run the parameter sweep, memoised on its inputs.
 
     The prices are passed in rather than re-fetched so the grid is computed on
     exactly the bars the displayed backtest used. Streamlit hashes the frame to
     build the cache key, which also means a forced data refresh invalidates the
     sweep automatically.
+
+    Every argument is one the grid genuinely depends on, which is what makes the
+    memoisation safe: an input left out of this signature would be an input the
+    cache ignores, and the heatmap would go on showing a grid computed under the
+    previous setting.
 
     Args:
         prices: OHLCV frame to sweep over.
@@ -672,13 +677,16 @@ def cached_sweep(prices: pd.DataFrame, initial_cash: float, fast_windows: Tuple,
         commission: Proportional commission per trade, as a fraction.
         spread: Bid-ask spread as a fraction of price.
         slippage: Adverse price move as a fraction of price, per side.
+        enter_on_existing_trend: The warm-up boundary setting of the run being
+            described, so every cell measures the same strategy the report does.
 
     Returns:
-        The sweep result, as returned by run_parameter_sweep.sweep.
+        The sweep result, as returned by analytics.validation.sweep.
     """
     return sweep(prices, initial_cash, fast_windows=fast_windows,
                  slow_windows=slow_windows, commission=commission,
-                 spread=spread, slippage=slippage)
+                 spread=spread, slippage=slippage,
+                 enter_on_existing_trend=enter_on_existing_trend)
 
 
 def sweep_windows(selected: int, grid: Sequence[int]) -> Tuple[int, ...]:
@@ -724,7 +732,8 @@ def render_sweep(state: Dict[str, Any]) -> None:
     st.subheader("Is this parameter choice robust, or an isolated peak?")
     st.caption(
         f"Every cell is a full backtest of one fast and slow pair over the same "
-        f"dates and costs, coloured against the benchmark's own Sharpe: warm "
+        f"dates, costs and warm-up setting, coloured against the benchmark's "
+        f"own Sharpe: warm "
         f"beats buy-and-hold, cool loses to it, blank means the fast window was "
         f"not shorter than the slow one. Your {fast}/{slow} is outlined. A good "
         f"score surrounded by other good scores is a plateau worth trusting; one "
@@ -744,6 +753,10 @@ def render_sweep(state: Dict[str, Any]) -> None:
         st.caption("Not run yet.")
         return
 
+    # The warm-up setting is read off the strategy object rather than off the
+    # sidebar, so it is by construction the one the displayed report was produced
+    # under. Sweeping under any other value would put a different strategy's
+    # score in the cell the caption labels as the user's own.
     with st.spinner("Sweeping the fast and slow window grid..."):
         results = cached_sweep(
             state["prices"],
@@ -753,6 +766,7 @@ def render_sweep(state: Dict[str, Any]) -> None:
             config.commission,
             config.spread,
             config.slippage,
+            bool(strategy.enter_on_existing_trend),
         )
 
     grid = metric_grid(results, SHARPE)

@@ -28,6 +28,20 @@ from scipy import stats
 from analytics.risk import as_float_series, max_drawdown, periodic_returns
 from constants import TRADING_DAYS_PER_YEAR
 
+# Largest dispersion, measured relative to the size of the returns themselves,
+# that is treated as no dispersion at all. See sharpe_ratio for why the test has
+# to be relative rather than a comparison against zero.
+#
+# The value sits in a wide empty band. Machine epsilon for a double is about
+# 2.2e-16, and the rounding error accumulated by compounding an equity curve and
+# then differencing it back into returns lands one or two orders of magnitude
+# above that. Meanwhile the ratio of standard deviation to mean absolute return
+# for any real return series is of order 1, and even an implausibly steady one
+# would not reach 1e-6. So 1e-12 is far above the noise and far below anything
+# genuine, which lets it separate the two without having to judge whether a
+# strategy's volatility is suspiciously low.
+NEGLIGIBLE_DEVIATION = 1e-12
+
 
 def total_return(equity: pd.Series) -> float:
     """Total percentage change between the first and last value of the curve.
@@ -132,7 +146,11 @@ def sharpe_ratio(
     Returns:
         The annualized Sharpe ratio, negative when the strategy fails to beat
         the risk-free rate. Returns NaN when fewer than two returns exist, when
-        volatility is zero, or when the inputs are out of range.
+        the returns carry no dispersion worth speaking of relative to their own
+        size, or when the inputs are out of range. That second condition covers
+        both an exactly constant return stream and one that is constant up to
+        floating point noise; see the comment on the guard for why the
+        distinction matters.
     """
     returns = periodic_returns(equity)
     if len(returns) < 2 or periods_per_year <= 0:
@@ -144,7 +162,38 @@ def sharpe_ratio(
 
     excess = returns - periodic_risk_free
     deviation = float(excess.std(ddof=1))
-    if not np.isfinite(deviation) or deviation <= 0:
+
+    # WHY THE ZERO TEST HAS TO BE RELATIVE
+    # A curve whose returns are all identical has no dispersion, so Sharpe is
+    # undefined and NaN is the right answer. Testing deviation <= 0 for that
+    # looks sufficient and is not, because the returns are almost never exactly
+    # identical: an equity curve is built by compounding and then differenced
+    # back into returns, and the rounding error of that round trip leaves a
+    # dispersion of around 1e-17 where the arithmetic says zero.
+    #
+    # That residue is positive, so an absolute test waves it through, and Sharpe
+    # then divides a real mean by numerical dust. Losing exactly 5% every period
+    # reported a Sharpe of -2.5e15. The sign at least made that one obvious; the
+    # dangerous version is the positive one, because a parameter sweep ranks by
+    # Sharpe and a spurious value with fifteen digits wins every time. The
+    # combination producing it is the least interesting on the grid, having
+    # merely managed to be numerically constant.
+    #
+    # Comparing against the scale of the returns fixes it. The noise floor of
+    # the differencing is proportional to the magnitude of the returns, so their
+    # mean absolute value is the correct reference. Note that the scale comes
+    # from the returns rather than from the excess: subtracting the risk-free
+    # rate does not change the dispersion, but it can drive the excess
+    # arbitrarily close to zero and would make the reference collapse for
+    # reasons that have nothing to do with precision.
+    #
+    # A genuinely flat curve still returns NaN, as before: its returns are all
+    # exactly zero, so both the deviation and the scale are zero and the
+    # comparison holds.
+    scale = float(returns.abs().mean())
+    if not np.isfinite(deviation) or not np.isfinite(scale):
+        return float("nan")
+    if deviation <= NEGLIGIBLE_DEVIATION * scale:
         return float("nan")
 
     return float(excess.mean() / deviation * np.sqrt(periods_per_year))

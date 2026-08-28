@@ -73,9 +73,16 @@ from strategies.moving_average import MovingAverageCrossover
 FAST_WINDOWS: Tuple[int, ...] = (10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
 SLOW_WINDOWS: Tuple[int, ...] = (50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300)
 
-# True throughout, matching run_comparison so every script describes the same
-# strategy. The setting applies uniformly to every cell, so it shifts the whole
-# surface rather than distorting its shape, and the robustness read is unaffected.
+# The default sweep setting, True to match run_comparison so every command-line
+# script describes the same strategy. It applies uniformly to every cell, so it
+# shifts the whole surface rather than distorting its shape, and the robustness
+# read is unaffected by which value is used.
+#
+# It is a default rather than a fixed constant because a caller may already have
+# a run of its own to be consistent with. The dashboard is the case that matters:
+# it lets the user set this option, so a grid hard-wired to True would have
+# described a different strategy from the report shown beside it, and the cell
+# labelled as the user's own would have carried someone else's score.
 ENTER_ON_EXISTING_TREND = True
 
 # Cells within this fraction of the best count as part of the good region, and
@@ -94,7 +101,9 @@ class Robustness(NamedTuple):
         best_score: Score of that cell.
         neighbour_mean: Mean score of its immediate neighbours, up to eight.
         neighbour_count: How many neighbours existed and were valid.
-        plateau_share: Fraction of valid cells within PLATEAU_TOLERANCE of best.
+        plateau_share: Fraction of valid cells within PLATEAU_TOLERANCE of the
+            best, the band being a fraction of the best score when that score is
+            positive and of the grid's own spread otherwise. See assess.
         contiguity: Fraction of top-decile cells touching another top-decile
             cell. NaN when the top decile holds a single cell.
         beats_reference: Fraction of valid cells scoring above the reference.
@@ -122,6 +131,7 @@ def sweep(
     commission: float = 0.0,
     spread: float = 0.0,
     slippage: float = 0.0,
+    enter_on_existing_trend: bool = ENTER_ON_EXISTING_TREND,
 ) -> pd.DataFrame:
     """Backtest every valid window combination and keep all of its metrics.
 
@@ -142,6 +152,10 @@ def sweep(
         commission: Proportional commission per trade, applied to every cell.
         spread: Bid-ask spread as a fraction of price.
         slippage: Adverse price move as a fraction of price.
+        enter_on_existing_trend: The crossover's warm-up boundary behaviour,
+            applied to every cell. A caller comparing the grid against a run of
+            its own must pass the same value that run used, or the cell standing
+            for that run will report a different strategy's score.
 
     Returns:
         A DataFrame whose rows are metric labels and whose columns are a
@@ -164,7 +178,7 @@ def sweep(
             strategy = MovingAverageCrossover(
                 fast_window=fast,
                 slow_window=slow,
-                enter_on_existing_trend=ENTER_ON_EXISTING_TREND,
+                enter_on_existing_trend=enter_on_existing_trend,
             )
             result = Backtester(
                 prices,
@@ -276,10 +290,20 @@ def assess(grid: pd.DataFrame, reference: float) -> Robustness:
 
     # Proportional tolerance for positive scores, and absolute for the rest: a
     # Sharpe near zero would make a percentage band meaninglessly narrow.
+    #
+    # The absolute band is measured against the grid's own spread, not against
+    # the best score, because the best score is exactly what has stopped being a
+    # usable scale. Taking a fraction of it collapses the band to nothing at
+    # best_score == 0, which is the one point the fallback exists to handle: the
+    # plateau share would then count only the cells at or above zero and drop a
+    # neighbour a hundredth away. Whichever of the two scales is larger is used,
+    # so a grid that is uniformly negative still gets a band from its own level
+    # rather than from its narrow spread.
     if best_score > 0:
         threshold = best_score * (1.0 - PLATEAU_TOLERANCE)
     else:
-        threshold = best_score - abs(best_score) * PLATEAU_TOLERANCE - 1e-12
+        spread = float(valid.max() - valid.min())
+        threshold = best_score - max(abs(best_score), spread) * PLATEAU_TOLERANCE
 
     top_cutoff = float(np.quantile(valid, TOP_QUANTILE))
     is_top = np.isfinite(values) & (values >= top_cutoff)
