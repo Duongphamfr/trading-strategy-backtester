@@ -55,6 +55,7 @@ from analytics.report import (
     LOW_EXPOSURE_THRESHOLD,
     MAX_DRAWDOWN,
     PARAMETRIC_VAR,
+    PERCENT_METRICS,
     R_SQUARED,
     SHARPE,
     SKEWNESS,
@@ -75,7 +76,8 @@ from analytics.validation import (
     reference_value,
     sweep,
 )
-from data.market_data import get_price_data
+from data.market_data import (DataSourceUnavailable, get_price_data,
+                              period_label)
 from engine.backtester import BacktestResult, Backtester
 from engine.broker import Broker
 from engine.portfolio import Portfolio
@@ -454,6 +456,8 @@ def execute(config: BacktestConfig) -> Dict[str, Any]:
         A dict holding the prices, the BacktestResult and the report.
 
     Raises:
+        DataSourceUnavailable: Propagated from the data layer when the download
+            could not be made, as distinct from being made and coming back empty.
         ValueError: Propagated from the data layer for an unknown ticker or an
             empty date range, and from the engine for too short a history.
     """
@@ -487,6 +491,42 @@ def execute(config: BacktestConfig) -> Dict[str, Any]:
 
     return {"prices": prices, "result": result, "report": report,
             "config": config}
+
+
+def delta_label(metric: str, difference: float) -> str:
+    """Render a strategy-minus-benchmark difference in the unit it is really in.
+
+    THE UNIT CHANGES WHEN YOU SUBTRACT, AND THE SYMBOL HAS TO FOLLOW
+    A return of 41.71% less a return of 329.44% is not a return of -287.73%. It
+    is a difference of 287.73 percentage points, and rendering it with the same
+    "%" the two returns carry states something impossible: a long-only position
+    cannot lose more than all of its capital, so no reader can take -287.73% at
+    face value and still be reading about a return.
+
+    On a benchmark that returned 74% the arithmetic never left the plausible
+    range, which is why the mislabelling survived so long. A high-return asset
+    exposes it immediately.
+
+    Percentage points fix the symbol without touching the number. The subtraction
+    was always the right quantity and is unchanged; only its rendering moves from
+    a unit it never had to the one it always did.
+
+    Which metrics need it is read from PERCENT_METRICS rather than listed here, so
+    a card added later inherits the right unit from the same table that decides
+    how its value is printed.
+
+    Args:
+        metric: The report row label, used to decide the unit.
+        difference: Strategy value minus benchmark value, in the metric's own
+            units, so a ratio for a percentage metric.
+
+    Returns:
+        A label ready for st.metric's delta, keeping the leading sign that
+        Streamlit reads to choose the arrow's direction.
+    """
+    if metric in PERCENT_METRICS:
+        return f"{difference * 100:+.2f} pp vs buy & hold"
+    return f"{difference:+.3f} vs buy & hold"
 
 
 def render_headline(report: pd.DataFrame) -> None:
@@ -532,7 +572,7 @@ def render_headline(report: pd.DataFrame) -> None:
         column.metric(
             title,
             "n/a" if pd.isna(value) else template.format(value),
-            delta=(f"{template.format(value - reference)} vs buy & hold"
+            delta=(delta_label(metric, value - reference)
                    if comparable else None),
             delta_color="off" if reason else "normal",
             help=tooltip,
@@ -893,8 +933,12 @@ def render_results(state: Dict[str, Any]) -> None:
     result: BacktestResult = state["result"]
     report: pd.DataFrame = state["report"]
 
-    st.subheader(f"{config.ticker.strip().upper()} · {config.start} to "
-                 f"{config.end} · {len(state['prices'])} bars")
+    # Dates read off the bars rather than off the date pickers, so a ticker whose
+    # listing postdates the chosen start reports the period it actually covers.
+    period = period_label(state["prices"], config.start.isoformat(),
+                          config.end.isoformat())
+    st.subheader(f"{config.ticker.strip().upper()} · {period} · "
+                 f"{len(state['prices'])} bars")
     charged = (f"commission {config.commission:.3%}, spread "
                f"{config.spread:.3%}, slippage {config.slippage:.3%}"
                if config.charges_costs else "no transaction costs")
@@ -969,13 +1013,24 @@ def main() -> None:
     # only in a local variable would vanish the moment anything is touched.
     # Keeping it in session state lets the report stay on screen while the user
     # reads it and adjusts the next run's inputs.
+    # The three types caught here are the three ways a run can fail for a reason
+    # the user can act on, and each already carries a sentence written for them.
+    # DataSourceUnavailable is the one this handler used to miss: the transport's
+    # exception escaped, and Streamlit answered a lost connection with a traceback
+    # pointing into yfinance. It is listed by name rather than reached through its
+    # OSError base so that a genuine filesystem failure, which the user cannot fix
+    # by retrying, still surfaces.
+    #
+    # Nothing broader is caught on purpose. An AttributeError or a KeyError here
+    # would be a bug in this project, and turning it into a tidy banner would only
+    # make it harder to find.
     if run:
         try:
             with st.spinner("Running backtest..."):
                 st.session_state["last_run"] = execute(config)
             st.session_state.pop("error", None)
             st.session_state.pop("sweep_requested", None)
-        except (ValueError, TypeError) as error:
+        except (DataSourceUnavailable, ValueError, TypeError) as error:
             st.session_state.pop("last_run", None)
             st.session_state["error"] = str(error)
 

@@ -32,6 +32,21 @@ of real AAPL data. Passing float_precision="round_trip" selects a correctly
 rounded parser and makes the round trip bit-exact, verified on both real and
 adversarial data. Without that single argument the cache would quietly reintroduce
 the very drift it exists to remove, only smaller.
+
+TWO WAYS A FETCH CAN FAIL, AND WHY THEY ARE DIFFERENT EXCEPTIONS
+"There is no such ticker" and "I could not reach the source" call for different
+answers from a caller, so this module raises different types. The first is a
+ValueError: the argument was wrong and repeating the call cannot help. The second
+is DataSourceUnavailable: the argument may be perfectly good and the same call may
+well succeed in a minute. A user offline, behind a proxy or being rate limited is
+in the second case, and telling them to check their ticker symbol would send them
+looking in the wrong place.
+
+Without the distinction the second case did not merely produce a poor message: the
+transport's own exception escaped this module entirely, and the dashboard showed a
+raw traceback because its handler had no reason to expect an exception type from a
+library it never imports. Translating here is what lets every caller handle both
+cases without knowing which HTTP stack yfinance currently uses.
 """
 
 import hashlib
@@ -39,10 +54,11 @@ import os
 import re
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
+from yfinance.exceptions import YFException
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -63,6 +79,104 @@ CACHE_VERSION = 1
 # because they match what the download already returns and are far finer than
 # daily bars require.
 INDEX_DTYPE = "datetime64[s]"
+
+
+class DataSourceUnavailable(OSError):
+    """The price source could not be reached, so there is no answer yet.
+
+    Distinct from the ValueError raised for an unknown ticker: this one says
+    nothing about whether the request was reasonable, only that it could not be
+    delivered. A caller may sensibly retry it, which is never true of a ValueError
+    from this module.
+
+    It derives from OSError rather than from Exception because that is the
+    category its own causes come from, and it keeps a caller that already handles
+    OSError working without having to learn this class exists.
+    """
+
+
+# How far the data may fall short of the request before that is worth explaining.
+# A request landing on a weekend or a holiday needs no comment: the longest modern
+# closure of the US equity market ran four days, which with the weekends on either
+# side makes a week the natural cut. Beyond it the history genuinely does not
+# reach, and saying so is the difference between a label and a guess.
+RANGE_TOLERANCE_DAYS = 7
+
+
+def covered_range(prices: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """First and last bar actually present in a price frame.
+
+    Args:
+        prices: A frame indexed by date, as returned by get_price_data.
+
+    Returns:
+        The first and last index entries.
+
+    Raises:
+        ValueError: If the frame is empty, which has no range to report.
+    """
+    if prices.empty:
+        raise ValueError("An empty price frame covers no range.")
+    return prices.index[0], prices.index[-1]
+
+
+def period_label(
+    prices: pd.DataFrame,
+    requested_start: Optional[str] = None,
+    requested_end: Optional[str] = None,
+) -> str:
+    """Describe the period a price frame actually covers.
+
+    WHY THE REQUEST IS THE WRONG THING TO PRINT
+    Yahoo returns what it has, not what was asked for, so a ticker listed in 2024
+    answers a request starting in 2020 with an eight-times-shorter history and no
+    complaint. Labelling the request made every report of such a ticker overstate
+    its own study period: a header reading "2020-01-01 to 2026-08-01 (592 bars)"
+    contradicted itself, since 6.6 years of daily bars is closer to 1,660 than to
+    592, and a Sharpe ratio earned over 2.4 years was presented as the product of
+    6.6. No computed figure was ever affected, all of them being driven by the
+    bars themselves, but the sentence describing them was wrong.
+
+    The request is still worth showing when it differs materially, otherwise
+    someone who typed 2020 and reads 2024 would reasonably wonder whether their
+    input was ignored. Within RANGE_TOLERANCE_DAYS the difference is just the
+    calendar and is left unsaid.
+
+    This lives beside the loader rather than in a display module because it states
+    a fact about the data, and because five call sites print this label; one
+    implementation is what stops them from disagreeing.
+
+    Args:
+        prices: A frame indexed by date, as returned by get_price_data.
+        requested_start: The start that was asked for, as YYYY-MM-DD. Optional;
+            without it no comparison is made and only the actual range is shown.
+        requested_end: The end that was asked for, as YYYY-MM-DD.
+
+    Returns:
+        A string such as "2020-01-02 to 2022-12-30", with the request appended in
+        parentheses when the data falls materially short of it.
+
+    Raises:
+        ValueError: If the frame is empty.
+    """
+    first, last = covered_range(prices)
+    actual = f"{first.date()} to {last.date()}"
+
+    if requested_start is None and requested_end is None:
+        return actual
+
+    tolerance = pd.Timedelta(days=RANGE_TOLERANCE_DAYS)
+    clipped = False
+    if requested_start is not None:
+        clipped = clipped or (first - pd.Timestamp(requested_start)) > tolerance
+    if requested_end is not None:
+        clipped = clipped or (pd.Timestamp(requested_end) - last) > tolerance
+
+    if not clipped:
+        return actual
+
+    asked = " to ".join(part for part in (requested_start, requested_end) if part)
+    return f"{actual} (requested {asked})"
 
 
 def get_price_data(
@@ -101,8 +215,12 @@ def get_price_data(
         a downloaded one, dtypes included.
 
     Raises:
-        ValueError: If Yahoo Finance returns no data at all, which usually means
-            an invalid ticker symbol, an invalid date range, or a network error.
+        DataSourceUnavailable: If the network or the provider prevented the
+            download. A cached range never reaches the network and so never
+            raises this, which is worth knowing when working offline.
+        ValueError: If Yahoo Finance was reached and returned no data at all,
+            which usually means an invalid ticker symbol or a date range holding
+            no trading days.
     """
     path = _cache_path(ticker, start, end)
 
@@ -119,6 +237,35 @@ def get_price_data(
 def _download(ticker: str, start: str, end: str) -> pd.DataFrame:
     """Fetch raw daily bars from Yahoo Finance.
 
+    WHERE THE LINE IS DRAWN BETWEEN A FAILED FETCH AND A BUG
+    Two exception trees are translated into DataSourceUnavailable, and everything
+    else is left to propagate.
+
+    OSError is Python's own category for an external resource failing, and every
+    HTTP stack yfinance has shipped puts its exceptions inside it: requests and
+    curl_cffi both derive RequestException from OSError, as do urllib's URLError
+    and the socket layer's own errors, along with the builtin ConnectionError and
+    TimeoutError. Catching the base rather than a list of leaves is what keeps
+    this working when the library changes transport, which it has already done
+    once.
+
+    YFException is yfinance's own base, for the failures it detects itself rather
+    than at the transport layer. YFRateLimitError is the one that matters: being
+    throttled is a temporary condition with a perfectly valid ticker, and it does
+    not arrive as an OSError.
+
+    Anything outside those two trees propagates untouched, and that is the point
+    of naming them rather than catching Exception. A TypeError means these
+    arguments do not match the signature; an AttributeError or a KeyError means
+    the library moved and the call needs revisiting. Those are our bugs, they are
+    not fixed by retrying, and a banner reading "check your connection" would hide
+    exactly the kind of breakage that must be loud during development.
+
+    The residual risk is stated rather than papered over: an exception from
+    neither tree would once again reach the caller unhandled. The test suite pins
+    the current behaviour so that such a change is a failing test rather than a
+    surprise in the browser.
+
     Args:
         ticker: Ticker symbol using Yahoo Finance notation.
         start: Start date in "YYYY-MM-DD" format (inclusive).
@@ -128,22 +275,35 @@ def _download(ticker: str, start: str, end: str) -> pd.DataFrame:
         Whatever yfinance returned, uncleaned.
 
     Raises:
-        ValueError: If the download produced nothing.
+        DataSourceUnavailable: If the source could not be reached or refused the
+            request.
+        ValueError: If the source was reached and returned nothing.
     """
-    frame = yf.download(
-        ticker,
-        start=start,
-        end=end,
-        auto_adjust=True,
-        progress=False,
-    )
+    try:
+        frame = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False,
+        )
+    except (OSError, YFException) as error:
+        raise DataSourceUnavailable(
+            f"Could not reach Yahoo Finance to download '{ticker}' "
+            f"({type(error).__name__}: {error}). This is a problem with the "
+            f"connection to the data source, not with the ticker symbol. Check "
+            f"that you are online, and if you are behind a proxy or have been "
+            f"rate limited, waiting a moment and retrying usually works. Any "
+            f"range already in the local cache still loads normally."
+        ) from error
 
     if frame is None or frame.empty:
         raise ValueError(
             f"Failed to download data for ticker '{ticker}' between "
             f"{start} and {end}. Please check that the ticker symbol follows "
             f"Yahoo Finance notation and that the date range contains valid "
-            f"trading days."
+            f"trading days. A source that is refusing requests can also return "
+            f"nothing, so if the symbol is definitely right, try again shortly."
         )
 
     return frame

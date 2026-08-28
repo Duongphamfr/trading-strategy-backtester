@@ -45,6 +45,7 @@ plot_heatmap knows nothing about backtesting, taking only a DataFrame and
 labels, so it can be reused for any grid in the Phase 6 figures.
 """
 
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -70,7 +71,7 @@ from analytics.validation import (
     reference_value,
     sweep,
 )
-from data.market_data import get_price_data
+from data.market_data import covered_range, get_price_data, period_label
 
 TICKER = "AAPL"
 START = "2020-01-01"
@@ -89,6 +90,55 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 # useful comparison: how the conventional choice, the one a researcher would have
 # made without seeing this grid, actually fared.
 CONVENTIONAL_CELL = (50, 200)
+
+
+def heatmap_path(ticker: str, first: str, last: str, commission: float) -> Path:
+    """Where the heatmap for one ticker, period and cost scenario is written.
+
+    WHY THE TICKER AND THE PERIOD ARE IN THE NAME
+    They were not, and the omission cost a figure. The file used to be named
+    after the cost scenario alone, so sweeping any second ticker overwrote the
+    tracked image of the first under a name that still implied the first. The
+    figure inside always carried the right title, which is exactly what made the
+    substitution hard to notice: the file looked current and was simply about a
+    different asset than its filename suggested.
+
+    A saved figure is an output keyed on its inputs, the same way a cache entry
+    is, and naming it after only one of three inputs guarantees a collision as
+    soon as the others vary. Since the sweep is meant to be run across assets,
+    that is not a corner case.
+
+    WHY THE DATES ARE THE COVERED ONES AND NOT THE REQUESTED ONES
+    A filename outlives the run that produced it, which makes a wrong one worse
+    than a wrong console line: it can be cited from a write-up months later. The
+    requested range is not what the image shows. Asking for AAPL to 2023-01-01
+    yields bars ending 2022-12-30, so the old name said 2020-2023 of a figure
+    covering 2020-2022; on a recently listed ticker the overstatement runs to
+    years. Keying on the covered range also makes the name honest about identity:
+    two different requests that resolve to the same bars produce the same figure
+    and now share the one file, correctly.
+
+    The ticker is sanitised because Yahoo notation admits characters a filesystem
+    reads as structure: "BRK/B" would name a directory that does not exist. Only
+    legibility is at stake here, unlike in the data cache where a collision would
+    serve one asset's prices for another, so a substitution is enough and no hash
+    is needed.
+
+    Args:
+        ticker: Yahoo Finance symbol the sweep ran on.
+        first: First date actually present in the data, as YYYY-MM-DD. Pass what
+            the bars say, not what was requested.
+        last: Last date actually present in the data, as YYYY-MM-DD.
+        commission: Proportional commission the grid was swept under.
+
+    Returns:
+        The path to write to, inside OUTPUT_DIR.
+    """
+    scenario = "free" if commission == 0.0 else f"commission_{commission:.4f}"
+    symbol = re.sub(r"[^A-Za-z0-9._-]", "-", ticker)
+    return OUTPUT_DIR / (
+        f"ma_sharpe_heatmap_{symbol}_{first[:4]}-{last[:4]}_{scenario}.png"
+    )
 
 
 def plot_heatmap(
@@ -317,7 +367,13 @@ def main(
     """
     prices = get_price_data(ticker, start, end)
 
-    title = (f"PARAMETER SWEEP  {ticker}  {start} to {end}  "
+    # Every label below, the printed title and the one drawn into each figure,
+    # comes from the bars rather than the request, so the filename, the image and
+    # the console agree on what period was studied.
+    first, last = covered_range(prices)
+    covered = (str(first.date()), str(last.date()))
+
+    title = (f"PARAMETER SWEEP  {ticker}  {period_label(prices, start, end)}  "
              f"({len(prices)} bars)")
     print(title)
     print("=" * len(title))
@@ -333,11 +389,11 @@ def main(
         grid = metric_grid(results, SHARPE)
         reference = reference_value(results, SHARPE)
 
-        suffix = "free" if commission == 0.0 else f"commission_{commission:.4f}"
         path = plot_heatmap(
             grid,
-            OUTPUT_DIR / f"ma_sharpe_heatmap_{suffix}.png",
-            title=(f"MA crossover Sharpe ratio, {ticker} {start[:4]}-{end[:4]}\n"
+            heatmap_path(ticker, *covered, commission),
+            title=(f"MA crossover Sharpe ratio, {ticker} "
+                   f"{first.year}-{last.year}\n"
                    f"commission {commission:.2%}; white line on the bar marks "
                    f"buy-and-hold at {reference:.3f}"),
             metric_label="Sharpe ratio",

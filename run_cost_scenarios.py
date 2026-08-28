@@ -45,7 +45,7 @@ from analytics.report import (
     TOTAL_RETURN,
     performance_report,
 )
-from data.market_data import get_price_data
+from data.market_data import get_price_data, period_label
 from engine.backtester import Backtester
 from strategies.base_strategy import BaseStrategy
 from strategies.momentum import Momentum
@@ -112,18 +112,25 @@ COMBINED_SCENARIOS: Tuple[CostScenario, ...] = (
     CostScenario("all at 0.10%", 0.0010, 0.0010, 0.0010),
 )
 
-# Column layout for the scenario tables, as (metric key, heading, width, format).
-# Cost levels are the rows, so the metrics vary across columns and
+# Column layout for the scenario tables, as (metric key, heading, width, format,
+# scale). Cost levels are the rows, so the metrics vary across columns and
 # analytics.report.format_report cannot be reused: it formats a cell from its row
 # label. Declaring everything here keeps the presentation in one place instead of
 # scattering format strings through prints. The headings are shortened from the
 # metric names because the full labels are wider than the numbers beneath them.
-COLUMNS: Tuple[Tuple[str, str, int, str], ...] = (
-    (TOTAL_RETURN, "Return", 11, "{:.2%}"),
-    (SHARPE, "Sharpe", 9, "{:.3f}"),
-    (NUMBER_OF_TRADES, "Trades", 8, "{:.0f}"),
-    (RETURN_GAP, "vs B&H", 11, "{:+.2%}"),
-    (SHARPE_GAP, "Sharpe vs B&H", 15, "{:+.3f}"),
+#
+# The scale exists for one column. RETURN_GAP holds a difference of two returns,
+# which is percentage points rather than a percentage, and printing it with "%"
+# claimed the impossible on a strong benchmark: a strategy up 41.71% against a
+# benchmark up 329.44% showed as "-287.73%", a loss larger than the capital at
+# risk. The stored value stays a ratio, since that is what every other consumer
+# reads; only the rendering multiplies up into the unit the heading now names.
+COLUMNS: Tuple[Tuple[str, str, int, str, float], ...] = (
+    (TOTAL_RETURN, "Return", 11, "{:.2%}", 1.0),
+    (SHARPE, "Sharpe", 9, "{:.3f}", 1.0),
+    (NUMBER_OF_TRADES, "Trades", 8, "{:.0f}", 1.0),
+    (RETURN_GAP, "vs B&H (pp)", 13, "{:+.2f}", 100.0),
+    (SHARPE_GAP, "Sharpe vs B&H", 15, "{:+.3f}", 1.0),
 )
 
 
@@ -219,7 +226,7 @@ def scenario_table(
 
     table = pd.DataFrame(rows).T
     table.index.name = "Cost"
-    return table[[name for name, _, _, _ in COLUMNS]]
+    return table[[name for name, _, _, _, _ in COLUMNS]]
 
 
 def break_even_commission(
@@ -287,15 +294,15 @@ def print_table(table: pd.DataFrame) -> None:
     label_width = max(len(str(label)) for label in table.index) + 2
 
     header = " " * label_width + "".join(
-        f"{heading:>{width}}" for _, heading, width, _ in COLUMNS
+        f"{heading:>{width}}" for _, heading, width, _, _ in COLUMNS
     )
     print(header)
     print("-" * len(header))
 
     for label in table.index:
         cells = "".join(
-            f"{template.format(table.loc[label, name]):>{width}}"
-            for name, _, width, template in COLUMNS
+            f"{template.format(table.loc[label, name] * scale):>{width}}"
+            for name, _, width, template, scale in COLUMNS
         )
         print(f"{str(label):<{label_width}}{cells}")
 
@@ -397,7 +404,8 @@ def main(
     prices = get_price_data(ticker, start, end)
     strategies = build_strategies()
 
-    title = f"COST SCENARIOS  {ticker}  {start} to {end}  ({len(prices)} bars)"
+    title = (f"COST SCENARIOS  {ticker}  {period_label(prices, start, end)}  "
+             f"({len(prices)} bars)")
     print(title)
     print("=" * len(title))
     print(f"Initial cash: {initial_cash:,.2f}")

@@ -64,7 +64,7 @@ from analytics.report import (
     TOTAL_RETURN,
     performance_report,
 )
-from data.market_data import get_price_data
+from data.market_data import get_price_data, period_label
 from engine.backtester import Backtester
 from strategies.moving_average import MovingAverageCrossover
 
@@ -551,8 +551,8 @@ def main(
     """
     prices = get_price_data(ticker, start, end)
 
-    title = (f"WALK-FORWARD VALIDATION  {ticker}  {start} to {end}  "
-             f"({len(prices)} bars)")
+    title = (f"WALK-FORWARD VALIDATION  {ticker}  "
+             f"{period_label(prices, start, end)}  ({len(prices)} bars)")
     print(title)
     print("=" * len(title))
     print(f"In-sample {IN_SAMPLE_BARS} bars, out-of-sample "

@@ -35,7 +35,7 @@ from analytics.report import (
     performance_report,
     report_caveats,
 )
-from data.market_data import get_price_data
+from data.market_data import get_price_data, period_label
 from engine.backtester import Backtester
 from strategies.base_strategy import BaseStrategy
 from strategies.mean_reversion import RSIMeanReversion
@@ -224,7 +224,14 @@ def print_verdict(combined: pd.DataFrame) -> None:
         else:
             verdict = "beat" if excess > 0 else "lost"
 
-        print(f"  {label:<14} return {excess:+8.2%} ({verdict})"
+        # The excess is a difference of two returns, which makes it percentage
+        # points and not a percentage. Printed with a "%" it claims the
+        # impossible on a strong benchmark: trailing a stock that tripled reads
+        # as "-287.73%" beside a strategy that actually gained 41.71%, and a
+        # long-only position cannot lose more than everything. The number is
+        # untouched, only its unit is now stated correctly. The verdict above
+        # reads the sign alone, so it is unaffected either way.
+        print(f"  {label:<14} return {excess * 100:+8.2f} pp ({verdict})"
               f"   Sharpe {sharpe_gap:+.3f}")
 
 
@@ -276,7 +283,11 @@ def main(
     reports = run_all(prices, initial_cash, strategies)
     combined = side_by_side(reports)
 
-    title = f"{ticker}  {start} to {end}  ({len(prices)} bars)"
+    # The label describes the bars in hand, not the request that fetched them.
+    # Yahoo answers a request that predates a listing with a shorter history and
+    # no complaint, so printing the request would overstate the study period.
+    title = (f"{ticker}  {period_label(prices, start, end)}  "
+             f"({len(prices)} bars)")
     print(title)
     print("=" * len(title))
     print(f"Initial cash: {initial_cash:,.2f}")

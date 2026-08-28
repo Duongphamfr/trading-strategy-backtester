@@ -328,7 +328,13 @@ def report_caveats(
                 "Falling less than a fully invested benchmark, while holding "
                 "cash on nine bars in ten, measures absence from the market and "
                 "not better risk control. Total Return and the Trades section "
-                "are unaffected on both counts."
+                "are unaffected on both counts. In the limit of no position at "
+                "all, Beta reads a defined 0.000 while R Squared reads n/a, "
+                "which looks inconsistent and is not: a flat return series has a "
+                "genuine regression slope of zero, but no variance of its own for "
+                "the market to explain, so the ratio behind R Squared is zero "
+                "over zero. Read that Beta as held nothing rather than as "
+                "market-neutral, which is a position taken and this is not."
             )
 
     return notes
@@ -469,9 +475,27 @@ def _as_flag(p_value: float) -> float:
 
 
 def _format_value(label: str, value: float) -> str:
-    """Render one cell according to what its row measures."""
+    """Render one cell according to what its row measures.
+
+    ON THE ADDITION OF ZERO
+    IEEE-754 has two zeros, and the negative one reaches this function whenever a
+    metric negates a zero to obey a sign convention. The VaR family is where it
+    shows: the module reports a loss as a positive magnitude by returning
+    -quantile, so an all-cash strategy, whose every return is exactly zero, hands
+    over -0.0 and the table reads "-0.00%" for a quantity documented as positive.
+
+    Adding zero collapses the two, since -0.0 + 0.0 is +0.0 by the standard, and
+    leaves every other double untouched: the addition is exact for all finite
+    values and for the infinities. NaN never arrives here, having returned above.
+
+    Doing it once here rather than at each computation site is deliberate. The
+    sign of a zero is a rendering concern and nothing else, -0.0 == 0.0 is true so
+    no comparison or test anywhere can distinguish them, and a metric added later
+    that negates its own zero is covered without anyone remembering to.
+    """
     if pd.isna(value):
         return "n/a"
+    value = value + 0.0
     if label in FLAG_METRICS:
         return "yes" if value >= 0.5 else "no"
     if label in PERCENT_METRICS:
