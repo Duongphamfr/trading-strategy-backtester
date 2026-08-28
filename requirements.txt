@@ -1,7 +1,13 @@
 # Install with: pip install -r requirements.txt
 
+# Engine, strategies and analytics. The command-line scripts need only these.
 matplotlib==3.11.1
 numpy==2.5.2
 pandas==3.0.5
 scipy==1.18.1
 yfinance==1.7.0
+
+# Dashboard only (app.py). Nothing below the UI layer imports these, so the
+# engine remains usable without installing them.
+plotly==7.0.0
+streamlit==1.62.0
