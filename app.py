@@ -64,6 +64,11 @@ from strategies.base_strategy import BaseStrategy
 from strategies.mean_reversion import RSIMeanReversion
 from strategies.momentum import Momentum
 from strategies.moving_average import MovingAverageCrossover
+from visualization.charts import (
+    drawdown_chart,
+    equity_curve_chart,
+    trade_marker_chart,
+)
 
 DEFAULT_TICKER = "AAPL"
 DEFAULT_START = date(2020, 1, 1)
@@ -462,6 +467,43 @@ def render_headline(report: pd.DataFrame) -> None:
         )
 
 
+def render_charts(state: Dict[str, Any]) -> None:
+    """Render the three figures, each under the question it answers.
+
+    The captions are not decoration. A chart that a reader cannot immediately
+    connect to a question is the thing the guideline warns against, and stating
+    the question above the figure is the cheapest way to prevent it.
+
+    Args:
+        state: The dict returned by execute.
+    """
+    result: BacktestResult = state["result"]
+    equity = result.equity_curve["total_value"]
+
+    st.subheader("Did the strategy beat buying and holding?")
+    st.caption("Both curves start from the same capital, so they can be read "
+               "against each other directly. Hover anywhere to see both values "
+               "on that date; drag to zoom, double-click to reset.")
+    st.plotly_chart(equity_curve_chart(equity, result.benchmark_curve),
+                    width="stretch")
+
+    st.subheader("How bad did the losses get, and how long did they last?")
+    st.caption("Distance below zero is how far the portfolio sat under its own "
+               "previous best. Width matters as much as depth: a shallow "
+               "decline that takes years to recover is its own kind of "
+               "expensive.")
+    st.plotly_chart(drawdown_chart(equity, result.benchmark_curve),
+                    width="stretch")
+
+    st.subheader("Where did the strategy actually act?")
+    st.caption("Green triangles mark entries, red triangles exits, placed at "
+               "the closing price of the bar they were filled on. Hover for "
+               "the size of each order.")
+    st.plotly_chart(trade_marker_chart(state["prices"]["Close"],
+                                       result.trade_log),
+                    width="stretch")
+
+
 def render_results(state: Dict[str, Any]) -> None:
     """Render a completed backtest.
 
@@ -500,6 +542,12 @@ def render_results(state: Dict[str, Any]) -> None:
     # banners instead of scraping them out of preformatted text.
     for note in report_caveats(report):
         st.warning(note)
+
+    # The charts come before the table because the guideline calls the equity
+    # curve the single most important figure, and because a shape is read faster
+    # than thirty numbers. The table stays underneath for anyone who wants the
+    # figure behind the shape.
+    render_charts(state)
 
     st.subheader("Performance report")
     st.caption("Strategy against an uncharged buy-and-hold benchmark over the "

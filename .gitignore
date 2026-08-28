@@ -19,6 +19,12 @@ htmlcov/
 # Cached market data. Regenerated on demand, and not ours to redistribute.
 data/cache/
 
+# Interactive figures written by the charts self-test. Each one embeds its own
+# data and a Plotly bundle reference, so they are large, regenerable and noisy in
+# a diff. The PNG heatmaps in the same directory stay tracked: those are curated
+# results referenced from the write-up, not test output.
+output/*.html
+
 # Notebooks
 .ipynb_checkpoints/
 
