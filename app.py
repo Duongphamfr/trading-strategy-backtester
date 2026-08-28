@@ -40,7 +40,7 @@ a well-behaved caller, but a user should never see that exception.
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -65,6 +65,16 @@ from analytics.report import (
     performance_report,
     report_caveats,
 )
+from analytics.validation import (
+    FAST_WINDOWS,
+    PLATEAU_TOLERANCE,
+    SLOW_WINDOWS,
+    assess,
+    cell_neighbours,
+    metric_grid,
+    reference_value,
+    sweep,
+)
 from data.market_data import get_price_data
 from engine.backtester import BacktestResult, Backtester
 from engine.broker import Broker
@@ -76,6 +86,7 @@ from strategies.moving_average import MovingAverageCrossover
 from visualization.charts import (
     drawdown_chart,
     equity_curve_chart,
+    parameter_heatmap_chart,
     returns_distribution_chart,
     trade_marker_chart,
 )
@@ -633,6 +644,230 @@ def render_charts(state: Dict[str, Any]) -> None:
 
     st.plotly_chart(returns_distribution_chart(equity), width="stretch")
 
+    render_sweep(state)
+
+
+# The sweep runs one backtest per grid cell, so it is the only expensive thing
+# the dashboard does. Caching on the inputs means a second look costs nothing,
+# and the button means it is never paid for by someone who only wanted the
+# equity curve. Both are needed: the cache alone would still charge the first
+# view of every new ticker or cost setting.
+@st.cache_data(show_spinner=False)
+def cached_sweep(prices: pd.DataFrame, initial_cash: float, fast_windows: Tuple,
+                 slow_windows: Tuple, commission: float, spread: float,
+                 slippage: float) -> pd.DataFrame:
+    """Run the parameter sweep, memoised on its inputs.
+
+    The prices are passed in rather than re-fetched so the grid is computed on
+    exactly the bars the displayed backtest used. Streamlit hashes the frame to
+    build the cache key, which also means a forced data refresh invalidates the
+    sweep automatically.
+
+    Args:
+        prices: OHLCV frame to sweep over.
+        initial_cash: Starting capital.
+        fast_windows: Fast windows to try. A tuple, since the cache key must be
+            hashable.
+        slow_windows: Slow windows to try.
+        commission: Proportional commission per trade, as a fraction.
+        spread: Bid-ask spread as a fraction of price.
+        slippage: Adverse price move as a fraction of price, per side.
+
+    Returns:
+        The sweep result, as returned by run_parameter_sweep.sweep.
+    """
+    return sweep(prices, initial_cash, fast_windows=fast_windows,
+                 slow_windows=slow_windows, commission=commission,
+                 spread=spread, slippage=slippage)
+
+
+def sweep_windows(selected: int, grid: Sequence[int]) -> Tuple[int, ...]:
+    """The standard grid with the user's own value folded in.
+
+    The sidebar sliders step in fives while the sweep grid steps in tens, so the
+    combination actually being run is usually not a cell of the standard grid.
+    Rather than silently snapping the marker to the nearest cell, which would
+    show the user a score that is not theirs, the exact value is added to the
+    axis. It costs one extra row or column of backtests and makes the marker
+    truthful.
+
+    Args:
+        selected: The value the user chose.
+        grid: The standard axis for this dimension.
+
+    Returns:
+        The sorted union of the two, without duplicates.
+    """
+    return tuple(sorted(set(grid) | {int(selected)}))
+
+
+def render_sweep(state: Dict[str, Any]) -> None:
+    """Render the parameter sweep section, for the MA strategy only.
+
+    The heatmap answers a question none of the other figures can: whether the
+    result just shown was a property of the rule or an accident of two numbers.
+    It is specific to the moving average crossover, which is the strategy whose
+    parameters Phase 4 found an isolated peak for, so it is not offered at all
+    for the other two.
+
+    Args:
+        state: The dict returned by execute.
+    """
+    config: BacktestConfig = state["config"]
+    strategy = config.strategy
+    if not isinstance(strategy, MovingAverageCrossover):
+        return
+
+    fast = int(strategy.fast_window)
+    slow = int(strategy.slow_window)
+
+    st.subheader("Is this parameter choice robust, or an isolated peak?")
+    st.caption(
+        f"Every cell is a full backtest of one fast and slow pair over the same "
+        f"dates and costs, coloured against the benchmark's own Sharpe: warm "
+        f"beats buy-and-hold, cool loses to it, blank means the fast window was "
+        f"not shorter than the slow one. Your {fast}/{slow} is outlined. A good "
+        f"score surrounded by other good scores is a plateau worth trusting; one "
+        f"surrounded by poor scores was luck. This runs a few hundred backtests "
+        f"and takes a moment the first time, then it is cached."
+    )
+
+    # The opt-in is remembered so the heatmap survives the reruns that any
+    # widget interaction triggers, exactly as the report does. It is deliberately
+    # forgotten when a new backtest is run, because that may be a different
+    # ticker or period where the sweep is a fresh multi-second cost, and
+    # incurring that silently would defeat the point of the button.
+    if st.button("Run parameter sweep", key="sweep_button"):
+        st.session_state["sweep_requested"] = True
+
+    if not st.session_state.get("sweep_requested"):
+        st.caption("Not run yet.")
+        return
+
+    with st.spinner("Sweeping the fast and slow window grid..."):
+        results = cached_sweep(
+            state["prices"],
+            config.initial_cash,
+            sweep_windows(fast, FAST_WINDOWS),
+            sweep_windows(slow, SLOW_WINDOWS),
+            config.commission,
+            config.spread,
+            config.slippage,
+        )
+
+    grid = metric_grid(results, SHARPE)
+    benchmark_sharpe = reference_value(results, SHARPE)
+
+    st.plotly_chart(
+        parameter_heatmap_chart(
+            grid,
+            center=benchmark_sharpe,
+            selected=(fast, slow),
+            subtitle=(f"{int(grid.notna().to_numpy().sum())} valid combinations · "
+                      f"colour centred on the benchmark's Sharpe of "
+                      f"{benchmark_sharpe:.3f}"),
+        ),
+        width="stretch",
+    )
+
+    render_robustness(grid, fast, slow, benchmark_sharpe)
+
+
+def render_robustness(grid: pd.DataFrame, fast: int, slow: int,
+                      benchmark_sharpe: float) -> None:
+    """Print the robustness read for the selected cell.
+
+    assess is reused for the grid-wide picture, and cell_neighbours for the
+    user's own cell, which assess cannot describe because it only ever looks at
+    the best one.
+
+    Args:
+        grid: The Sharpe grid.
+        fast: Selected fast window.
+        slow: Selected slow window.
+        benchmark_sharpe: The benchmark's Sharpe over the same dates.
+    """
+    summary = assess(grid, benchmark_sharpe)
+    own = float(grid.loc[fast, slow])
+    neighbours = cell_neighbours(grid, fast, slow)
+    neighbour_mean = (sum(neighbours) / len(neighbours) if neighbours
+                      else float("nan"))
+
+    left, right = st.columns(2)
+    left.metric(f"Your {fast}/{slow}", f"{own:.3f}",
+                delta=f"{own - benchmark_sharpe:+.3f} vs buy & hold")
+    right.metric(f"Grid best {summary.best_fast}/{summary.best_slow}",
+                 f"{summary.best_score:.3f}",
+                 delta=f"{summary.best_score - own:+.3f} vs your choice",
+                 delta_color="off")
+
+    st.markdown(verdict(own, neighbour_mean, len(neighbours), summary))
+
+
+def verdict(own: float, neighbour_mean: float, neighbour_count: int,
+            summary: Any) -> str:
+    """Compose the sentences interpreting the selected cell.
+
+    The plateau test compares the neighbourhood's mean against the cell's own
+    score using PLATEAU_TOLERANCE, the same band run_parameter_sweep uses to
+    decide whether the grid's best score sits on a plateau. Sharing it keeps the
+    dashboard's verdict and the command-line script's verdict on one definition.
+
+    Args:
+        own: Score of the selected cell.
+        neighbour_mean: Mean score of its valid neighbours.
+        neighbour_count: How many neighbours were valid.
+        summary: The Robustness summary for the whole grid.
+
+    Returns:
+        Markdown text.
+    """
+    lines = [
+        f"The {neighbour_count} combinations adjacent to yours average "
+        f"**{neighbour_mean:.3f}**, against your own **{own:.3f}**. "
+        f"Across the whole grid the median is {summary.median_score:.3f} and "
+        f"{summary.beats_reference:.0%} of combinations beat the benchmark."
+    ]
+
+    if not neighbour_count or pd.isna(neighbour_mean):
+        lines.append("Too few valid neighbours to judge the neighbourhood.")
+    elif own <= 0:
+        lines.append(
+            "Your combination does not clear zero, so robustness is beside the "
+            "point: there is no edge here to be robust."
+        )
+    elif neighbour_mean >= own * (1.0 - PLATEAU_TOLERANCE):
+        lines.append(
+            "The neighbours hold up, so this sits on a plateau rather than a "
+            "spike. That is the outcome to want: it suggests the score came "
+            "from the rule and would survive windows chosen a little "
+            "differently."
+        )
+    elif neighbour_mean >= own * 0.5:
+        lines.append(
+            "The neighbours fall off noticeably. The score is not a single "
+            "lucky cell, but it does depend on the windows more than a robust "
+            "setting should."
+        )
+    else:
+        lines.append(
+            "The neighbours collapse, so this is an isolated peak. A score that "
+            "vanishes when either window moves by one step is a property of "
+            "this particular history, not of the strategy, and it is exactly "
+            "what the walk-forward analysis found does not survive out of "
+            "sample."
+        )
+
+    if summary.best_score > own:
+        lines.append(
+            f"The grid's best cell scores {summary.best_score - own:+.3f} more "
+            f"than yours. Chasing it is the trap the whole exercise is meant to "
+            f"expose: that cell was chosen by looking at this history, and no "
+            f"trader had it in advance."
+        )
+
+    return "\n\n".join(lines)
+
 
 def render_results(state: Dict[str, Any]) -> None:
     """Render a completed backtest.
@@ -725,6 +960,7 @@ def main() -> None:
             with st.spinner("Running backtest..."):
                 st.session_state["last_run"] = execute(config)
             st.session_state.pop("error", None)
+            st.session_state.pop("sweep_requested", None)
         except (ValueError, TypeError) as error:
             st.session_state.pop("last_run", None)
             st.session_state["error"] = str(error)

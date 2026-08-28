@@ -72,7 +72,7 @@ from strategies.moving_average import MovingAverageCrossover
 # the parameters are chosen here by exactly the code that drew the heatmap. If
 # that search changes, this validation follows it instead of quietly testing a
 # different procedure.
-from run_parameter_sweep import ENTER_ON_EXISTING_TREND, metric_grid, sweep
+from analytics.validation import ENTER_ON_EXISTING_TREND, metric_grid, sweep
 
 TICKER = "AAPL"
 START = "2015-01-01"

@@ -16,6 +16,8 @@ reader actually has.
     trade_marker_chart          Where did the strategy actually act?
     returns_distribution_chart  Are the returns normal, or do they have fat
                                 tails?
+    parameter_heatmap_chart     Is this parameter choice robust, or an isolated
+                                peak?
 
 That framing is what keeps them uncluttered. Anything not needed to answer the
 question is left out, which is why the equity chart carries two lines rather
@@ -38,12 +40,20 @@ the quantity the performance report puts a number on, because both come from one
 implementation. A chart that quietly disagreed with the table beside it would be
 worse than no chart.
 
-It also keeps the four signatures uniform. A caller passes an equity curve and,
-where a comparison makes sense, a benchmark curve, without having to remember
-which figure wants raw values and which wants a transformation.
+It also keeps the signatures uniform among the figures that describe a single
+backtest: a caller passes an equity curve and, where a comparison makes sense, a
+benchmark curve, without having to remember which figure wants raw values and
+which wants a transformation.
+
+parameter_heatmap_chart is the one exception, and unavoidably so. It does not
+describe one backtest but a grid of several hundred, so it takes the swept grid
+that analytics.validation already produces. Recomputing a sweep inside a plotting
+function would be the wrong trade entirely: it would take minutes, and it would
+put the choice of what to sweep in the hands of the module least equipped to
+make it.
 """
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -78,6 +88,10 @@ BENCHMARK_NAME = "Buy and hold"
 
 TEMPLATE = "plotly_white"
 HEIGHT = 420
+
+# The heatmap needs more vertical room than the time-series figures: its cells
+# should stay close to square so that neither axis looks like the important one.
+HEATMAP_HEIGHT = 560
 
 # Bin count for the returns histogram. Enough to expose a fat tail without
 # turning the body of the distribution into noise at the few hundred to few
@@ -341,6 +355,94 @@ def returns_distribution_chart(
                   subtitle=_distribution_subtitle(equity, returns))
     figure.update_xaxes(tickformat=".1%")
     figure.update_layout(bargap=0.02)
+    return figure
+
+
+def parameter_heatmap_chart(
+    grid: pd.DataFrame,
+    center: float,
+    selected: Optional[Tuple[int, int]] = None,
+    metric_label: str = "Sharpe ratio",
+    title: str = "Sharpe across the fast and slow window grid",
+    subtitle: Optional[str] = None,
+    annotate: bool = True,
+) -> go.Figure:
+    """Plot a parameter sweep as an interactive heatmap.
+
+    The colour scale is diverging and centred on a reference score rather than
+    on the grid's own midpoint, which is what turns a decorative gradient into a
+    verdict: warm cells beat the reference, cool cells lose to it, and the
+    boundary between them is a real threshold instead of an artefact of the
+    range that happened to be swept. The reference is normally the benchmark's
+    score, since beating buy-and-hold is the only bar that matters.
+
+    WHY THE AXES ARE CATEGORICAL
+    Window values are not evenly spaced once a user's own choice is inserted
+    into a regular grid, and numeric axes would then draw cells of unequal
+    width, implying that some combinations cover more ground than others. They
+    do not: each cell is one backtest. Treating the labels as categories gives
+    every cell equal weight on screen, which is the honest rendering.
+
+    Invalid combinations, where the fast window is not shorter than the slow
+    one, arrive as NaN and are left as gaps. A gap reads correctly as "not
+    applicable" where a zero would read as "tested and worthless".
+
+    Args:
+        grid: Scores with fast windows as the index and slow windows as the
+            columns, as returned by metric_grid.
+        center: Score the colour scale pivots on, normally the benchmark's.
+        selected: A (fast, slow) pair to outline, or None. It must be present in
+            the grid, which is the caller's job to arrange.
+        metric_label: Name of the plotted quantity, used on the colour bar.
+        title: Figure title.
+        subtitle: Optional second line under the title.
+        annotate: Whether to print each cell's value inside it.
+
+    Returns:
+        A Plotly figure.
+    """
+    figure = go.Figure()
+
+    fast_labels = [str(value) for value in grid.index]
+    slow_labels = [str(value) for value in grid.columns]
+
+    figure.add_trace(go.Heatmap(
+        x=slow_labels,
+        y=fast_labels,
+        z=grid.to_numpy(dtype=float),
+        colorscale="RdBu",
+        reversescale=True,
+        zmid=center if pd.notna(center) else None,
+        colorbar=dict(title=metric_label),
+        hovertemplate=("Fast %{y} · Slow %{x}<br>"
+                       f"{metric_label} %{{z:.3f}}<extra></extra>"),
+        texttemplate="%{z:.2f}" if annotate else None,
+        textfont=dict(size=8),
+        hoverongaps=False,
+    ))
+
+    if selected is not None:
+        fast, slow = selected
+        figure.add_trace(go.Scatter(
+            x=[str(slow)],
+            y=[str(fast)],
+            name="Your selection",
+            mode="markers",
+            marker=dict(symbol="square-open", size=22, color=MODEL_COLOUR,
+                        line=dict(width=3)),
+            hovertemplate=(f"<b>Your selection</b><br>Fast {fast} · Slow {slow}"
+                           "<extra></extra>"),
+        ))
+
+    _apply_layout(figure, title, "Fast window (bars)",
+                  x_label="Slow window (bars)", x_hoverformat="",
+                  subtitle=subtitle)
+
+    # A heatmap wants the cell under the pointer, not every cell sharing an x
+    # value, so the module's unified date hover is the wrong mode here.
+    figure.update_layout(hovermode="closest", height=HEATMAP_HEIGHT)
+    figure.update_xaxes(type="category", showspikes=False)
+    figure.update_yaxes(type="category", showspikes=False)
     return figure
 
 
