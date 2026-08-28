@@ -320,8 +320,15 @@ def report_caveats(
                 "every bar. Those flat bars return exactly zero, which lowers "
                 "Volatility and both VaR figures, inflates Skewness and Excess "
                 "Kurtosis, and pulls Beta and R Squared toward zero. Read those "
-                "rows as a description of cash, not of the strategy. Total "
-                "Return, the drawdown rows and the Trades section are unaffected."
+                "rows as a description of cash, not of the strategy. The "
+                "drawdown rows need a different qualification rather than the "
+                "same one: a drawdown depth is a path extremum, not an average, "
+                "so flat bars cannot dilute it and the figure is exactly what "
+                "the portfolio suffered. What does not follow is the credit. "
+                "Falling less than a fully invested benchmark, while holding "
+                "cash on nine bars in ten, measures absence from the market and "
+                "not better risk control. Total Return and the Trades section "
+                "are unaffected on both counts."
             )
 
     return notes

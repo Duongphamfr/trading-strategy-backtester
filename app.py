@@ -40,18 +40,27 @@ a well-behaved caller, but a user should never see that exception.
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from analytics.report import (
     BENCHMARK_COLUMN,
+    BETA,
+    CONDITIONAL_VAR,
+    EXCESS_KURTOSIS,
     EXPOSURE,
+    HISTORICAL_VAR,
+    LOW_EXPOSURE_THRESHOLD,
     MAX_DRAWDOWN,
+    PARAMETRIC_VAR,
+    R_SQUARED,
     SHARPE,
+    SKEWNESS,
     STRATEGY_COLUMN,
     TOTAL_RETURN,
+    VOLATILITY,
     format_report,
     performance_report,
     report_caveats,
@@ -83,6 +92,47 @@ MOMENTUM_LABEL = "Momentum"
 # Shorter ranges run without error but produce an all-HOLD signal series and an
 # empty report, which looks like a bug rather than a short history.
 MINIMUM_BARS = 60
+
+# WHY SOME DELTA BADGES GO GREY WHEN THE STRATEGY SAT IN CASH
+#
+# A metric card shows the gap to buy-and-hold and colours it green when the gap
+# favours the strategy. That colouring is a claim, and for some metrics the claim
+# stops being true once exposure collapses, at which point a green badge would
+# contradict the caveat banner printed directly beneath it.
+#
+# Two different mechanisms are at work, which is why there are two sets rather
+# than one. Both suppress the colour; they do so for opposite reasons, and the
+# tooltip says which applies.
+#
+# CASH_DILUTED holds metrics computed as an average, a quantile or a regression
+# over every bar. Flat bars enter that sample as exact zeros and drag the result
+# toward zero, so the number is describing the cash the strategy was holding
+# rather than the strategy itself. These are the rows report_caveats names.
+#
+# CASH_FLATTERED holds metrics whose value is honest but whose comparison is not.
+# A drawdown depth is a path extremum, not an average, so flat bars cannot dilute
+# it: the portfolio really did fall only that far. What does not survive scrutiny
+# is the credit for it. Falling less than a fully invested benchmark, while
+# holding cash on nine bars in ten, measures absence from the market and not
+# better risk control, so the achievement badge is withdrawn even though the
+# figure stands.
+#
+# Total Return, Sharpe and Sortino keep their colours. A return is a path
+# endpoint that flat bars leave untouched, and in the ratios the dilution hits
+# numerator and denominator together rather than one side only.
+CASH_DILUTED = frozenset({
+    VOLATILITY, HISTORICAL_VAR, PARAMETRIC_VAR, CONDITIONAL_VAR,
+    SKEWNESS, EXCESS_KURTOSIS, BETA, R_SQUARED,
+})
+CASH_FLATTERED = frozenset({MAX_DRAWDOWN})
+
+DILUTED_REASON = ("Badge greyed out: with exposure below "
+                  "{threshold:.0%} this figure is mostly describing the cash "
+                  "the strategy held, since flat bars enter it as zeros.")
+FLATTERED_REASON = ("Badge greyed out: the depth itself is real, but beating a "
+                    "fully invested benchmark on it while in cash below "
+                    "{threshold:.0%} exposure reflects absence from the market "
+                    "rather than better risk control.")
 
 
 @dataclass
@@ -444,27 +494,79 @@ def render_headline(report: pd.DataFrame) -> None:
         ("Exposure", EXPOSURE, "{:.2%}", False),
     )
 
+    cash_heavy = is_cash_heavy(report)
+
     for column, (title, metric, template, compare) in zip(st.columns(4), cards):
         value = report.loc[metric, STRATEGY_COLUMN]
         reference = report.loc[metric, BENCHMARK_COLUMN]
         comparable = compare and pd.notna(value) and pd.notna(reference)
 
+        reason = delta_disclaimer(metric) if cash_heavy else None
+
         # The delta carries the sign of the difference, which Streamlit colours
-        # green when positive. That reads correctly for all three compared
-        # metrics, including the drawdown: a strategy that fell 9% against the
-        # benchmark's 31% gives a positive difference, and a shallower drawdown
-        # is indeed the better outcome. The benchmark's own figure goes in the
-        # tooltip, since a difference alone cannot say what it was measured from.
+        # green when positive and red when negative. That colouring is an
+        # editorial claim, so it is switched off for any metric whose claim the
+        # caveat banner below would immediately dispute. delta_color="off"
+        # keeps the number and drops the colour, leaving the reader the figure
+        # without the verdict.
+        if pd.notna(reference):
+            tooltip = f"Buy and hold: {template.format(reference)}"
+            if reason and comparable:
+                tooltip = f"{tooltip}. {reason}"
+        else:
+            tooltip = ("Not defined for the benchmark, which is always fully "
+                       "invested.")
+
         column.metric(
             title,
             "n/a" if pd.isna(value) else template.format(value),
             delta=(f"{template.format(value - reference)} vs buy & hold"
                    if comparable else None),
-            help=(f"Buy and hold: {template.format(reference)}"
-                  if pd.notna(reference) else
-                  "Not defined for the benchmark, which is always fully "
-                  "invested."),
+            delta_color="off" if reason else "normal",
+            help=tooltip,
         )
+
+
+def is_cash_heavy(report: pd.DataFrame,
+                  threshold: float = LOW_EXPOSURE_THRESHOLD) -> bool:
+    """Whether exposure is low enough to qualify how the report reads.
+
+    The threshold is imported from analytics.report rather than restated here,
+    so the greyed-out badges and the caveat banner can never disagree about when
+    a report has become a description of cash. Moving the threshold in one place
+    moves both.
+
+    Args:
+        report: A report as returned by performance_report.
+        threshold: Exposure below which the qualification applies.
+
+    Returns:
+        True when exposure is present, known and below the threshold.
+    """
+    if EXPOSURE not in report.index or STRATEGY_COLUMN not in report.columns:
+        return False
+
+    exposure = report.loc[EXPOSURE, STRATEGY_COLUMN]
+    return bool(pd.notna(exposure) and exposure < threshold)
+
+
+def delta_disclaimer(metric: str,
+                     threshold: float = LOW_EXPOSURE_THRESHOLD) -> Optional[str]:
+    """The reason this metric's delta badge should not be coloured, if any.
+
+    Args:
+        metric: A row label from the report.
+        threshold: Exposure threshold, quoted back in the message.
+
+    Returns:
+        A sentence for the tooltip, or None when the metric's comparison
+        survives low exposure and keeps its colour.
+    """
+    if metric in CASH_DILUTED:
+        return DILUTED_REASON.format(threshold=threshold)
+    if metric in CASH_FLATTERED:
+        return FLATTERED_REASON.format(threshold=threshold)
+    return None
 
 
 def render_charts(state: Dict[str, Any]) -> None:
