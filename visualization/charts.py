@@ -11,9 +11,11 @@ The guideline asks for figures that are attractive without being empty, and
 makes the test concrete: a chart earns its place by answering a question a
 reader actually has.
 
-    equity_curve_chart   Did the strategy beat buying and holding?
-    drawdown_chart       How deep did the losses get, and how long did they last?
-    trade_marker_chart   Where did the strategy actually act?
+    equity_curve_chart          Did the strategy beat buying and holding?
+    drawdown_chart              How deep were the losses, and how long?
+    trade_marker_chart          Where did the strategy actually act?
+    returns_distribution_chart  Are the returns normal, or do they have fat
+                                tails?
 
 That framing is what keeps them uncluttered. Anything not needed to answer the
 question is left out, which is why the equity chart carries two lines rather
@@ -26,21 +28,34 @@ Green appears only on buys. Because the meanings are constant, a reader who has
 understood one chart has already understood the palette of the others, and no
 figure needs to explain its own colours.
 
-DRAWDOWNS ARE NOT RECOMPUTED HERE
-drawdown_chart takes an equity curve and calls drawdown_series from
-analytics.risk, rather than accepting a drawdown series from the caller. That
-costs a little flexibility and buys something worth more: the shape on screen is
-necessarily the same quantity the performance report puts a number on, since
-both come from one implementation. A chart that quietly disagreed with the table
-beside it would be worse than no chart.
+NOTHING DERIVED IS RECOMPUTED HERE
+Every function that needs a derived quantity takes the equity curve and asks
+analytics.risk for it: drawdown_chart calls drawdown_series, and
+returns_distribution_chart calls periodic_returns, skewness and kurtosis. None
+of them accepts the derived series from the caller. That costs a little
+flexibility and buys something worth more: the shape on screen is necessarily
+the quantity the performance report puts a number on, because both come from one
+implementation. A chart that quietly disagreed with the table beside it would be
+worse than no chart.
+
+It also keeps the four signatures uniform. A caller passes an equity curve and,
+where a comparison makes sense, a benchmark curve, without having to remember
+which figure wants raw values and which wants a transformation.
 """
 
 from typing import Any, Dict, List, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from scipy.stats import norm
 
-from analytics.risk import drawdown_series
+from analytics.risk import (
+    drawdown_series,
+    kurtosis,
+    periodic_returns,
+    skewness,
+)
 from constants import BUY, SELL
 
 STRATEGY_COLOUR = "#1f77b4"
@@ -48,6 +63,11 @@ BENCHMARK_COLOUR = "#9aa0a6"
 LOSS_COLOUR = "#d62728"
 GAIN_COLOUR = "#2ca02c"
 PRICE_COLOUR = "#5f6368"
+
+# Deliberately outside the semantic palette above. The fitted normal is not a
+# data series and must not borrow the grey that means benchmark; a dark dashed
+# line is the conventional way to draw a theoretical reference.
+MODEL_COLOUR = "#202124"
 
 # Plotly renders a fill at 100% opacity by default, which buries the gridlines
 # under it. The drawdown area reads better as a tint with its outline intact.
@@ -58,7 +78,14 @@ BENCHMARK_NAME = "Buy and hold"
 
 TEMPLATE = "plotly_white"
 HEIGHT = 420
-DATE_HOVER = "%{x|%d %b %Y}"
+
+# Bin count for the returns histogram. Enough to expose a fat tail without
+# turning the body of the distribution into noise at the few hundred to few
+# thousand returns a backtest of a handful of years produces.
+BINS = 80
+
+# Resolution of the fitted normal curve. It only has to look smooth.
+CURVE_POINTS = 200
 
 
 def equity_curve_chart(
@@ -232,6 +259,107 @@ def trade_marker_chart(
     return figure
 
 
+def returns_distribution_chart(
+    equity: pd.Series,
+    title: str = "Distribution of periodic returns",
+) -> go.Figure:
+    """Plot the histogram of periodic returns against a fitted normal curve.
+
+    The normal curve is fitted to the same mean and standard deviation as the
+    returns themselves, which is what makes the comparison fair and the
+    departures readable. Two departures matter and both are visible without any
+    statistics: a peak taller than the curve with tails poking out beyond it is
+    excess kurtosis, the fat tails that parametric VaR underestimates, and a
+    histogram leaning to one side of the curve is skew.
+
+    Densities are plotted rather than counts, because a probability density is
+    the only scale on which a histogram and a fitted curve are directly
+    comparable without an arbitrary rescaling factor.
+
+    TYING THE PICTURE TO THE TABLE
+    The subtitle carries the sample size, the share of returns that are exactly
+    zero, and the skewness and excess kurtosis. Those last two come from
+    analytics.risk called with the same argument the performance report passes,
+    so the numbers under the title are necessarily the Distribution rows of the
+    table, not a second opinion on them.
+
+    The share of exact zeros is always shown rather than only when it is large.
+    It is the one number that explains the shape of a cash-heavy strategy's
+    histogram, where a spike at zero dwarfs everything and the curve fitted
+    through it describes the flat bars rather than the trading. Stating it
+    unconditionally means the figure carries its own qualification wherever it
+    is displayed, including outside the dashboard.
+
+    Args:
+        equity: Portfolio value over time. Returns are derived with
+            periodic_returns rather than taken from the caller, so the sample
+            drawn here is the sample the report describes.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure. An equity curve too short to yield returns gives an
+        empty figure carrying an explanatory annotation rather than raising.
+    """
+    figure = go.Figure()
+    returns = periodic_returns(equity)
+
+    if returns.empty:
+        _apply_layout(figure, title, "Density", x_label="Periodic return",
+                      x_hoverformat=".2%",
+                      subtitle="Not enough history to compute a single return.")
+        return figure
+
+    values = returns.to_numpy(dtype=float)
+    figure.add_trace(go.Histogram(
+        x=values,
+        name="Actual returns",
+        histnorm="probability density",
+        nbinsx=BINS,
+        marker=dict(color=STRATEGY_COLOUR, line=dict(color="white", width=0.4)),
+        opacity=0.75,
+        hovertemplate="Actual density: %{y:.1f}<extra></extra>",
+    ))
+
+    average = float(values.mean())
+    deviation = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+
+    # A zero standard deviation means every return was identical, so there is no
+    # bell curve to fit. The histogram alone still tells the story.
+    if deviation > 0.0:
+        grid = np.linspace(values.min(), values.max(), CURVE_POINTS)
+        figure.add_trace(go.Scatter(
+            x=grid,
+            y=norm.pdf(grid, loc=average, scale=deviation),
+            name="Fitted normal",
+            mode="lines",
+            line=dict(color=MODEL_COLOUR, width=2, dash="dash"),
+            hovertemplate="Normal density: %{y:.1f}<extra></extra>",
+        ))
+
+    _apply_layout(figure, title, "Density", x_label="Periodic return",
+                  x_hoverformat=".2%",
+                  subtitle=_distribution_subtitle(equity, returns))
+    figure.update_xaxes(tickformat=".1%")
+    figure.update_layout(bargap=0.02)
+    return figure
+
+
+def _distribution_subtitle(equity: pd.Series, returns: pd.Series) -> str:
+    """Summarise the plotted sample in one line under the title.
+
+    Args:
+        equity: The curve the returns came from, as the risk functions expect.
+        returns: The periodic returns being plotted.
+
+    Returns:
+        A single line of plain text.
+    """
+    zero_share = float((returns == 0.0).mean())
+    return (f"{len(returns):,} returns · {zero_share:.1%} exactly zero · "
+            f"skewness {skewness(equity):.2f} · "
+            f"excess kurtosis {kurtosis(equity, excess=True):.2f}")
+
+
 def _order_hover(order: Dict[str, Any]) -> str:
     """Build the extra hover lines describing one filled order.
 
@@ -254,20 +382,37 @@ def _order_hover(order: Dict[str, Any]) -> str:
     return "<br>" + "<br>".join(lines)
 
 
-def _apply_layout(figure: go.Figure, title: str, y_label: str) -> None:
+def _apply_layout(
+    figure: go.Figure,
+    title: str,
+    y_label: str,
+    x_label: str = "Date",
+    x_hoverformat: str = "%d %b %Y",
+    subtitle: Optional[str] = None,
+) -> None:
     """Apply the styling every figure in this module shares.
 
-    Centralising it is what makes the charts look like a set rather than three
+    Centralising it is what makes the charts look like a set rather than four
     unrelated plots, and it is the only place a decision like the hover mode has
     to be made.
+
+    Three of the four figures share a date axis, which is why the x-axis
+    arguments default to dates rather than being spelled out at each call.
 
     Args:
         figure: The figure to style, modified in place.
         title: Figure title.
         y_label: Label for the vertical axis.
+        x_label: Label for the horizontal axis.
+        x_hoverformat: Format applied to the x value in the hover box.
+        subtitle: Optional smaller second line under the title. Rendered with
+            HTML rather than the layout's own subtitle field, which keeps the
+            function working across Plotly versions.
     """
+    heading = title if subtitle is None else f"{title}<br><sup>{subtitle}</sup>"
+
     figure.update_layout(
-        title=title,
+        title=heading,
         template=TEMPLATE,
         height=HEIGHT,
         # Unified hover is the point of these charts: one pointer position
@@ -278,7 +423,7 @@ def _apply_layout(figure: go.Figure, title: str, y_label: str) -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.0,
                     xanchor="right", x=1.0),
     )
-    figure.update_xaxes(title_text="Date", hoverformat="%d %b %Y",
+    figure.update_xaxes(title_text=x_label, hoverformat=x_hoverformat,
                         showspikes=True, spikemode="across", spikethickness=1)
     figure.update_yaxes(title_text=y_label)
 
@@ -305,6 +450,7 @@ if __name__ == "__main__":
         "equity_curve": equity_curve_chart(equity, result.benchmark_curve),
         "drawdown": drawdown_chart(equity, result.benchmark_curve),
         "trade_markers": trade_marker_chart(prices["Close"], result.trade_log),
+        "returns_distribution": returns_distribution_chart(equity),
     }
 
     print()
@@ -335,3 +481,31 @@ if __name__ == "__main__":
     single = equity_curve_chart(equity, None)
     print(f"With no benchmark supplied: {len(single.data)} trace "
           f"({single.data[0].name}).")
+
+    # The subtitle exists to tie the picture to the Distribution rows of the
+    # report, so the numbers it quotes have to be those rows and not a recount.
+    print()
+    subtitle = figures["returns_distribution"].layout.title.text.split("<sup>")[1]
+    print(f"Histogram subtitle: {subtitle.replace('</sup>', '')}")
+    print(f"skewness from analytics.risk:        {skewness(equity):.2f}")
+    print(f"excess kurtosis from analytics.risk: "
+          f"{kurtosis(equity, excess=True):.2f}")
+    print("Same functions, same argument, so the subtitle cannot drift from "
+          "the table.")
+
+    # A curve too short to yield a single return must not raise: parameter
+    # sweeps and short date ranges both reach this path.
+    print()
+    for label, curve in (("one bar", equity.iloc[:1]),
+                         ("empty", equity.iloc[:0])):
+        degenerate = returns_distribution_chart(curve)
+        note = degenerate.layout.title.text.split("<sup>")[1]
+        print(f"  {label:<8} -> {len(degenerate.data)} traces, "
+              f"subtitle: {note.replace('</sup>', '')}")
+
+    # A perfectly flat curve has a zero standard deviation, so there is no bell
+    # curve to fit. The histogram must still be drawn.
+    flat = pd.Series([10_000.0] * 50, index=equity.index[:50])
+    figure = returns_distribution_chart(flat)
+    print(f"  {'flat':<8} -> {len(figure.data)} trace "
+          f"({figure.data[0].name}), no normal fitted to a zero deviation")

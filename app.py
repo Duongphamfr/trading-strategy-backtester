@@ -76,6 +76,7 @@ from strategies.moving_average import MovingAverageCrossover
 from visualization.charts import (
     drawdown_chart,
     equity_curve_chart,
+    returns_distribution_chart,
     trade_marker_chart,
 )
 
@@ -580,6 +581,7 @@ def render_charts(state: Dict[str, Any]) -> None:
         state: The dict returned by execute.
     """
     result: BacktestResult = state["result"]
+    report: pd.DataFrame = state["report"]
     equity = result.equity_curve["total_value"]
 
     st.subheader("Did the strategy beat buying and holding?")
@@ -604,6 +606,32 @@ def render_charts(state: Dict[str, Any]) -> None:
     st.plotly_chart(trade_marker_chart(state["prices"]["Close"],
                                        result.trade_log),
                     width="stretch")
+
+    st.subheader("Are the returns normal, or do they have fat tails?")
+    st.caption("Bars are the strategy's own returns, the dashed line a normal "
+               "distribution fitted to the same mean and standard deviation. A "
+               "taller peak with returns poking out past the ends of the curve "
+               "is excess kurtosis, the fat tails that make Parametric VaR too "
+               "optimistic. A histogram leaning to one side of the curve is "
+               "skew. The subtitle repeats the two Distribution rows of the "
+               "table below.")
+
+    # The exposure threshold governs this note as it governs the caveat banner
+    # and the greyed-out badges, so all three appear and disappear together
+    # rather than each drawing its own line.
+    if is_cash_heavy(report):
+        st.info(
+            "Exposure is low, so most bars are flat and their returns are "
+            "exactly zero. That produces the single tall spike at the centre, "
+            "and it is an artifact of sitting in cash rather than a property "
+            "of the strategy's trading. The fitted curve is dragged toward "
+            "that spike too, so read this chart as a description of a mostly "
+            "idle account. The share of returns that are exactly zero is "
+            "printed under the title. A strategy that stays invested produces "
+            "a far more informative shape here."
+        )
+
+    st.plotly_chart(returns_distribution_chart(equity), width="stretch")
 
 
 def render_results(state: Dict[str, Any]) -> None:
