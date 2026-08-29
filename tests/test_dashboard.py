@@ -30,6 +30,7 @@ The three outcomes, one per row of the handler:
 No test here touches the network.
 """
 
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -37,7 +38,13 @@ import pytest
 import yfinance
 from streamlit.testing.v1 import AppTest
 
-from app import CUSTOM_CHOICE, PRESET_TICKERS
+from app import (
+    CUSTOM_CHOICE,
+    DEFAULT_END,
+    DEFAULT_START,
+    EARLIEST_DATE,
+    PRESET_TICKERS,
+)
 from data import market_data
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
@@ -77,6 +84,13 @@ def name_ticker(at: AppTest, ticker: str) -> AppTest:
     at.selectbox(key="ticker_choice").set_value(CUSTOM_CHOICE)
     at = at.run()
     at.text_input(key="custom_ticker").set_value(ticker)
+    return at.run()
+
+
+def choose_dates(at: AppTest, start: date, end: date) -> AppTest:
+    """Set both sidebar dates and rerun so the config sees them."""
+    at.date_input(key="start_date").set_value(start)
+    at.date_input(key="end_date").set_value(end)
     return at.run()
 
 
@@ -217,6 +231,55 @@ def test_the_sentinel_is_not_mistakable_for_a_symbol():
     assert CUSTOM_CHOICE not in PRESET_TICKERS
     assert TICKER_CHOICES[-1] == CUSTOM_CHOICE, "the sentinel belongs last"
     assert not CUSTOM_CHOICE.isupper()
+
+
+def test_the_date_pickers_still_open_on_the_documented_defaults():
+    """2020–2023 is the study window the rest of the project quotes."""
+    at = open_dashboard()
+
+    assert at.date_input(key="start_date").value == DEFAULT_START
+    assert at.date_input(key="end_date").value == DEFAULT_END
+
+
+def test_both_date_pickers_share_the_same_explicit_bounds():
+    """The 2008 crisis has to be reachable, and a future date must not be.
+
+    Streamlit's hidden ±10-year window around each default is what this locks
+    out: without explicit bounds the start picker refused anything before 2010.
+    Both widgets get the same pair so a date that is legal as a start is legal
+    as an end.
+    """
+    at = open_dashboard()
+    today = date.today()
+
+    for key in ("start_date", "end_date"):
+        picker = at.date_input(key=key)
+        assert picker.min == EARLIEST_DATE
+        assert picker.max == today
+
+
+def test_the_crisis_window_is_selectable():
+    """The README's 2008 finding has to be something a reader can reproduce."""
+    at = choose_dates(open_dashboard(), date(2008, 1, 1), date(2009, 6, 30))
+
+    assert at.date_input(key="start_date").value == date(2008, 1, 1)
+    assert at.date_input(key="end_date").value == date(2009, 6, 30)
+    assert banners(at) == ""
+
+
+def test_a_run_over_the_crisis_window_reaches_the_engine(monkeypatch):
+    """Selecting 2008–2009 is not only legal: Run actually fires a backtest."""
+    crisis = synthetic_history(bars=380, first="2008-01-02")
+    supply_history(monkeypatch, crisis)
+
+    at = choose_dates(open_dashboard(), date(2008, 1, 1), date(2009, 6, 30))
+    at = click_run(name_ticker(at, "SPY"))
+
+    assert tracebacks(at) == ""
+    assert banners(at) == ""
+    headings = " ".join(element.value for element in at.subheader)
+    assert "2008-01-02" in headings
+    assert "SPY" in headings
 
 
 def test_the_dropdown_opens_on_the_previous_default():

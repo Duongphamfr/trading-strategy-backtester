@@ -98,6 +98,20 @@ DEFAULT_START = date(2020, 1, 1)
 DEFAULT_END = date(2023, 1, 1)
 DEFAULT_CASH = 10_000.0
 
+# Shared bounds for both date pickers. Streamlit's implicit window, when
+# min_value and max_value are left unset, is ten years either side of each
+# widget's default. That silently locked the start picker at 2010-01-01 and made
+# the 2008 crisis — the regime the README's capital-protection finding lives in —
+# unselectable. Setting the bounds here is what makes that period reachable.
+#
+# The floor is early enough for 2008 and for most liquid names Yahoo still
+# serves; a ticker listed later is shortened to its real history by the data
+# layer, the same way it already is. The ceiling is today so a future date,
+# which Yahoo cannot fill, cannot be asked for. Both pickers share the same
+# pair: giving the end picker a later floor than the start picker would make
+# 2008 selectable as a start and then refuse it as an end.
+EARLIEST_DATE = date(2000, 1, 1)
+
 # A short, deliberately opinionated menu, so that trying the dashboard does not
 # start with recalling that Apple is AAPL. Names are carried beside the symbols
 # for the same reason: a bare symbol list still assumes the knowledge it is meant
@@ -507,8 +521,21 @@ def sidebar() -> Tuple[BacktestConfig, bool]:
 
     st.sidebar.subheader("Data")
     ticker = ticker_input()
-    start = st.sidebar.date_input("Start date", value=DEFAULT_START)
-    end = st.sidebar.date_input("End date", value=DEFAULT_END)
+    latest = date.today()
+    start = st.sidebar.date_input(
+        "Start date",
+        value=DEFAULT_START,
+        min_value=EARLIEST_DATE,
+        max_value=latest,
+        key="start_date",
+    )
+    end = st.sidebar.date_input(
+        "End date",
+        value=DEFAULT_END,
+        min_value=EARLIEST_DATE,
+        max_value=latest,
+        key="end_date",
+    )
     cash = st.sidebar.number_input(
         "Initial cash",
         min_value=100.0,
