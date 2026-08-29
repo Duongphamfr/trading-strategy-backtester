@@ -98,6 +98,63 @@ DEFAULT_START = date(2020, 1, 1)
 DEFAULT_END = date(2023, 1, 1)
 DEFAULT_CASH = 10_000.0
 
+# A short, deliberately opinionated menu, so that trying the dashboard does not
+# start with recalling that Apple is AAPL. Names are carried beside the symbols
+# for the same reason: a bare symbol list still assumes the knowledge it is meant
+# to spare the reader.
+#
+# Chosen for liquidity and for spread across sectors, since a backtest of one
+# mega-cap tech name after another teaches very little. The two index ETFs matter
+# most of all: a single stock flatters trend-following, and comparing a strategy on
+# SPY against the same strategy on TSLA is the quickest way to see how much of a
+# result belongs to the asset rather than to the rules.
+#
+# The list is not exhaustive and is not meant to be. Anything Yahoo serves is
+# reachable through the custom entry below.
+PRESET_TICKERS: Dict[str, str] = {
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "GOOGL": "Alphabet",
+    "AMZN": "Amazon",
+    "NVDA": "NVIDIA",
+    "META": "Meta",
+    "TSLA": "Tesla",
+    "JPM": "JPMorgan Chase",
+    "V": "Visa",
+    "JNJ": "Johnson & Johnson",
+    "UNH": "UnitedHealth",
+    "KO": "Coca-Cola",
+    "PG": "Procter & Gamble",
+    "WMT": "Walmart",
+    "XOM": "Exxon Mobil",
+    "CAT": "Caterpillar",
+    "SPY": "S&P 500 ETF",
+    "QQQ": "Nasdaq 100 ETF",
+}
+
+# The sentinel that reveals the free-text field. It is a member of the options
+# list rather than a separate checkbox so that picking a preset and entering
+# something exotic are visibly the same decision, made in one place.
+#
+# WHY NOT accept_new_options, WHICH IS THE NATIVE WAY TO DO THIS
+# st.selectbox grew an accept_new_options flag that turns it into an editable
+# combobox, and on the page it is plainly nicer than a sentinel: one widget, no
+# reveal step. It is rejected here for a reason outside the browser. Streamlit's
+# own AppTest harness cannot drive the off-list path in this version: both
+# set_value and a direct session_state assignment raise "not in list", because the
+# proxy resolves a value by looking up its index among the declared options. That
+# would leave the custom-symbol path with no automated coverage at all, including
+# the invalid-ticker and lost-connection banners that path has to reach.
+#
+# A sentinel keeps every state reachable from a test, since the sentinel itself is
+# a declared option and the revealed field is an ordinary text input. Little is
+# given up: selectbox already filters its options as you type, so a preset is
+# still found by typing three letters of it. Worth revisiting if a later
+# Streamlit teaches AppTest to type into a combobox.
+CUSTOM_CHOICE = "Custom…"
+
+TICKER_CHOICES: Tuple[str, ...] = (*PRESET_TICKERS, CUSTOM_CHOICE)
+
 MA_LABEL = "MA Crossover"
 RSI_LABEL = "RSI Mean Reversion"
 MOMENTUM_LABEL = "Momentum"
@@ -365,6 +422,80 @@ def round_trip_drag(commission: float, spread: float, slippage: float) -> float:
     return 1.0 - broker.sell_fill_price(1.0) / broker.buy_fill_price(1.0)
 
 
+def ticker_label(choice: str) -> str:
+    """Render one dropdown entry: the symbol, and whose it is.
+
+    Args:
+        choice: A preset symbol, or the custom sentinel.
+
+    Returns:
+        The text shown in the dropdown. The sentinel is passed through unchanged,
+        having no company behind it.
+    """
+    company = PRESET_TICKERS.get(choice)
+    return f"{choice} · {company}" if company else choice
+
+
+def resolve_ticker(choice: str, typed: str) -> str:
+    """Reduce the two ticker widgets to the one string the engine receives.
+
+    The dashboard offers two ways to name an asset and the engine knows about
+    none of them: BacktestConfig carries a symbol, exactly as it did when this was
+    a single text field. Keeping that reduction in a function of its own, rather
+    than inline in the sidebar, is what allows every combination to be tested
+    without rendering a page.
+
+    Typed input is upper-cased here so that the normalised symbol is what the
+    config carries, and therefore what the results heading shows. The data layer
+    normalises again on its own behalf, which is left alone: it protects the
+    command-line scripts, which never pass through this function.
+
+    An empty custom field deliberately resolves to the empty string rather than
+    falling back to a preset. That is what keeps the Run button disabled with
+    "Enter a ticker symbol." instead of quietly backtesting an asset the reader
+    did not choose.
+
+    Args:
+        choice: The dropdown selection: a preset symbol or CUSTOM_CHOICE.
+        typed: Contents of the custom field. Ignored unless the sentinel is
+            selected, so switching back to a preset cannot resurrect stale text.
+
+    Returns:
+        The symbol to backtest, upper-cased and stripped, possibly empty.
+    """
+    if choice == CUSTOM_CHOICE:
+        return typed.strip().upper()
+    return choice
+
+
+def ticker_input() -> str:
+    """Draw the ticker chooser and return the symbol it names.
+
+    Returns:
+        The symbol to backtest, empty when the custom field is still blank.
+    """
+    choice = st.sidebar.selectbox(
+        "Ticker",
+        options=TICKER_CHOICES,
+        index=TICKER_CHOICES.index(DEFAULT_TICKER),
+        format_func=ticker_label,
+        key="ticker_choice",
+        help="Pick a liquid name, or choose Custom… to enter any other symbol.",
+    )
+
+    typed = ""
+    if choice == CUSTOM_CHOICE:
+        typed = st.sidebar.text_input(
+            "Custom ticker",
+            key="custom_ticker",
+            placeholder="e.g. BRK-B, ^GSPC, ASML.AS",
+            help="Yahoo Finance notation. Case does not matter, and an unknown "
+                 "symbol is reported rather than guessed at.",
+        )
+
+    return resolve_ticker(choice, typed)
+
+
 def sidebar() -> Tuple[BacktestConfig, bool]:
     """Draw the whole sidebar and collect it into a configuration.
 
@@ -375,9 +506,7 @@ def sidebar() -> Tuple[BacktestConfig, bool]:
     st.sidebar.title("Backtest setup")
 
     st.sidebar.subheader("Data")
-    ticker = st.sidebar.text_input("Ticker", value=DEFAULT_TICKER,
-                                   help="Yahoo Finance notation, e.g. AAPL, "
-                                        "MSFT, BRK-B, ^GSPC.")
+    ticker = ticker_input()
     start = st.sidebar.date_input("Start date", value=DEFAULT_START)
     end = st.sidebar.date_input("End date", value=DEFAULT_END)
     cash = st.sidebar.number_input(

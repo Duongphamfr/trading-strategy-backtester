@@ -37,6 +37,7 @@ import pytest
 import yfinance
 from streamlit.testing.v1 import AppTest
 
+from app import CUSTOM_CHOICE, PRESET_TICKERS
 from data import market_data
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
@@ -56,17 +57,41 @@ def isolated_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(market_data, "CACHE_DIR", tmp_path / "cache")
 
 
-def run_dashboard(ticker: str = UNCACHED_TICKER) -> AppTest:
-    """Load the app, type a ticker, press Run Backtest, return the page."""
-    at = AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
-    at.text_input[0].set_value(ticker)
-    at = at.run()
+def open_dashboard() -> AppTest:
+    """Load the app with every widget at its default."""
+    return AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
 
+
+def name_ticker(at: AppTest, ticker: str) -> AppTest:
+    """Put a ticker into the sidebar, by whichever of the two routes it needs.
+
+    A preset is one selection. Anything else takes two steps, because the free
+    text field does not exist until the sentinel is chosen; the extra run in
+    between is what creates it. Both widgets are addressed by key rather than by
+    position so that reordering the sidebar cannot silently retarget a test.
+    """
+    if ticker in PRESET_TICKERS:
+        at.selectbox(key="ticker_choice").set_value(ticker)
+        return at.run()
+
+    at.selectbox(key="ticker_choice").set_value(CUSTOM_CHOICE)
+    at = at.run()
+    at.text_input(key="custom_ticker").set_value(ticker)
+    return at.run()
+
+
+def click_run(at: AppTest) -> AppTest:
+    """Press Run backtest and return the resulting page."""
     for button in at.button:
         if "run backtest" in button.label.lower():
             return button.click().run()
 
     raise AssertionError("The Run Backtest button was not found on the page.")
+
+
+def run_dashboard(ticker: str = UNCACHED_TICKER) -> AppTest:
+    """Load the app, name a ticker, press Run backtest, return the page."""
+    return click_run(name_ticker(open_dashboard(), ticker))
 
 
 def banners(at: AppTest) -> str:
@@ -114,6 +139,137 @@ def empty_the_source(monkeypatch) -> None:
     """Make the source answer, with nothing, as it does for an unknown symbol."""
     monkeypatch.setattr(yfinance, "download",
                         lambda *args, **kwargs: pd.DataFrame())
+
+
+# --------------------------------------------------------------------------
+# Naming a ticker: a dropdown of presets, or anything at all
+# --------------------------------------------------------------------------
+#
+# The engine's side of this is unchanged: BacktestConfig still carries one symbol
+# string, exactly as when the sidebar held a single text field. What is new is that
+# two widgets can supply it, so what is worth locking is the reduction of those two
+# to that one, and the fact that neither route bypasses validation.
+#
+# Note that every error-handling test in this file already runs through the custom
+# route, UNCACHED_TICKER being deliberately absent from the presets. The clean
+# banners for an unknown symbol, a lost connection and a rate limit are therefore
+# all exercised on typed input rather than on a preset.
+
+def test_a_preset_is_passed_through_untouched():
+    """Picking from the list needs no normalising: the list is already canonical."""
+    from app import resolve_ticker
+
+    assert resolve_ticker("MSFT", "") == "MSFT"
+
+
+def test_a_typed_symbol_is_upper_cased_and_trimmed():
+    """So that "aapl" and " aapl " name the same asset as "AAPL"."""
+    from app import resolve_ticker
+
+    assert resolve_ticker(CUSTOM_CHOICE, "  brk-b  ") == "BRK-B"
+
+
+def test_text_left_behind_cannot_resurrect_itself():
+    """Switching back to a preset must ignore whatever the field still holds.
+
+    Streamlit keeps a keyed widget's value across reruns, so the custom text
+    survives the field being hidden. Reading it regardless of the dropdown would
+    backtest a symbol the reader had visibly moved away from.
+    """
+    from app import resolve_ticker
+
+    assert resolve_ticker("KO", "TSLA") == "KO"
+
+
+@pytest.mark.parametrize("typed", ["", "   ", "\t\n"])
+def test_an_unfilled_custom_field_resolves_to_nothing(typed: str):
+    """Not to a fallback. Empty is what keeps the Run button disabled."""
+    from app import resolve_ticker
+
+    assert resolve_ticker(CUSTOM_CHOICE, typed) == ""
+
+
+def test_the_preset_list_is_a_clean_set_of_symbols():
+    """Guards the table itself: no duplicates, no stray case, no empty entries."""
+    symbols = list(PRESET_TICKERS)
+
+    assert len(symbols) == len(set(symbols)), "a duplicated preset"
+    assert all(symbol == symbol.strip().upper() for symbol in symbols)
+    assert all(PRESET_TICKERS[symbol] for symbol in symbols), "a preset with no name"
+    assert 15 <= len(symbols) <= 20, "the list is meant to stay short"
+
+
+def test_the_list_spans_more_than_one_kind_of_asset():
+    """A menu of mega-cap tech would teach the reader that any strategy works.
+
+    The index ETFs are the ones that matter: comparing a strategy on SPY with the
+    same strategy on a single volatile name is how the reader sees how much of a
+    result belongs to the asset.
+    """
+    assert {"SPY", "QQQ"} <= set(PRESET_TICKERS)
+    assert {"KO", "JNJ", "XOM", "JPM"} <= set(PRESET_TICKERS)
+
+
+def test_the_sentinel_is_not_mistakable_for_a_symbol():
+    """It shares the dropdown with real symbols, so it must not look like one."""
+    from app import TICKER_CHOICES
+
+    assert CUSTOM_CHOICE not in PRESET_TICKERS
+    assert TICKER_CHOICES[-1] == CUSTOM_CHOICE, "the sentinel belongs last"
+    assert not CUSTOM_CHOICE.isupper()
+
+
+def test_the_dropdown_opens_on_the_previous_default():
+    """The field used to default to AAPL, and existing screenshots assume it."""
+    at = open_dashboard()
+
+    assert at.selectbox(key="ticker_choice").value == "AAPL"
+
+
+def test_each_entry_shows_whose_symbol_it_is():
+    """The point of the list is to spare the reader recalling that Apple is AAPL."""
+    from app import ticker_label
+
+    assert ticker_label("AAPL") == "AAPL · Apple"
+    # The sentinel has no company behind it and is passed through.
+    assert ticker_label(CUSTOM_CHOICE) == CUSTOM_CHOICE
+
+
+def test_the_free_text_field_appears_only_when_it_is_asked_for():
+    """A permanently visible box beside the dropdown would be two ways to answer."""
+    at = open_dashboard()
+    assert len(at.text_input) == 0
+
+    at.selectbox(key="ticker_choice").set_value(CUSTOM_CHOICE)
+    at = at.run()
+    assert len(at.text_input) == 1
+
+    at.selectbox(key="ticker_choice").set_value("AAPL")
+    at = at.run()
+    assert len(at.text_input) == 0
+
+
+def test_a_preset_runs_end_to_end(monkeypatch):
+    """The quick path, all the way to a rendered result."""
+    supply_history(monkeypatch, synthetic_history())
+
+    at = run_dashboard("KO")
+
+    assert tracebacks(at) == ""
+    assert banners(at) == ""
+    assert any("KO" in element.value for element in at.subheader)
+
+
+def test_a_lower_case_custom_symbol_reaches_the_engine_upper_cased(monkeypatch):
+    """The normalisation, observed where the reader sees it rather than in a unit."""
+    supply_history(monkeypatch, synthetic_history())
+
+    at = run_dashboard("brk-b")
+
+    assert tracebacks(at) == ""
+    headings = " ".join(element.value for element in at.subheader)
+    assert "BRK-B" in headings
+    assert "brk-b" not in headings
 
 
 # --------------------------------------------------------------------------
@@ -194,10 +350,28 @@ def test_an_empty_ticker_cannot_even_be_run():
     """Validation catches this before any download is attempted.
 
     Worth pinning because it is the cheapest of the three defences and the only
-    one that stops the user rather than reporting to them.
+    one that stops the user rather than reporting to them. Reaching an empty
+    ticker now takes choosing Custom… and typing whitespace, the dropdown having
+    no blank entry to select.
     """
-    at = AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
-    at.text_input[0].set_value("   ")
+    at = name_ticker(open_dashboard(), "   ")
+
+    button = next(element for element in at.button
+                  if "run backtest" in element.label.lower())
+
+    assert button.proto.disabled
+    assert "Enter a ticker symbol." in banners(at)
+
+
+def test_choosing_custom_without_typing_yet_does_not_offer_to_run():
+    """The state between revealing the field and filling it.
+
+    A blank custom field must not fall back to the preset that was showing a
+    moment ago: backtesting an asset the reader did not choose is worse than
+    asking them to finish typing.
+    """
+    at = open_dashboard()
+    at.selectbox(key="ticker_choice").set_value(CUSTOM_CHOICE)
     at = at.run()
 
     button = next(element for element in at.button

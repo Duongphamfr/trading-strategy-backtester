@@ -39,3 +39,12 @@ Thumbs.db
 
 # Environment variables
 .env
+
+# Internal planning brief. Kept on disk for local use; not part of the public repo.
+GUIDELINE.md
+
+# Local Streamlit skill shortcuts. They are relative symlinks into venv/, so they
+# break for anyone who clones without that exact layout, and they are not part
+# of the backtester.
+.agents/
+.claude/
